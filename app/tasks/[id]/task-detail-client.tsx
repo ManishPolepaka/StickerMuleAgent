@@ -49,6 +49,7 @@ export type TaskDetail = {
   taskNumber: string;
   prompt: string;
   status: string;
+  requiresHumanApproval?: boolean;
   investigationSummary: string | null;
   reasoningSummary: string | null;
   selectedAction: string | null;

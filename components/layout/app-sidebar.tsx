@@ -48,15 +48,19 @@ export function AppSidebar() {
   useEffect(() => {
     for (const item of nav) router.prefetch(item.href);
     warmAllPageData();
-    const idle =
-      "requestIdleCallback" in window
-        ? window.requestIdleCallback(() => warmAllPageData(), { timeout: 1500 })
-        : window.setTimeout(() => warmAllPageData(), 400);
+    let idleHandle: number;
+    let usedIdleCallback = false;
+    if (typeof window.requestIdleCallback === "function") {
+      usedIdleCallback = true;
+      idleHandle = window.requestIdleCallback(() => warmAllPageData(), { timeout: 1500 });
+    } else {
+      idleHandle = window.setTimeout(() => warmAllPageData(), 400);
+    }
     return () => {
-      if (typeof idle === "number" && "cancelIdleCallback" in window) {
-        window.cancelIdleCallback(idle as number);
+      if (usedIdleCallback && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleHandle);
       } else {
-        window.clearTimeout(idle as number);
+        window.clearTimeout(idleHandle);
       }
     };
   }, [router]);
