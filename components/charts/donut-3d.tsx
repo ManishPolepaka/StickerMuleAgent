@@ -39,16 +39,19 @@ function arcPath(
 
 export function Donut3D({
   successful,
+  pending = 0,
   failed,
 }: {
   successful: number;
+  pending?: number;
   failed: number;
 }) {
-  const total = successful + failed;
+  const total = successful + pending + failed;
   if (total <= 0) return null;
 
   const slices: Slice[] = [
     { name: "Successful", value: successful, color: "#2563eb", soft: "#60a5fa" },
+    { name: "Pending", value: pending, color: "#f59e0b", soft: "#fbbf24" },
     { name: "Failed", value: failed, color: "#f43f5e", soft: "#fb7185" },
   ].filter((s) => s.value > 0);
 
@@ -120,10 +123,14 @@ export function Donut3D({
         </div>
       </div>
 
-      <div className="flex items-center justify-center gap-5 text-xs text-slate-600">
+      <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-xs text-slate-600">
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2.5 w-2.5 rounded-full bg-[#2563eb]" />
           Successful {successful}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-full bg-[#f59e0b]" />
+          Pending {pending}
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2.5 w-2.5 rounded-full bg-[#f43f5e]" />

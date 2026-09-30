@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   Area,
@@ -29,6 +29,8 @@ import { Donut3D } from "@/components/charts/donut-3d";
 import { formatDateTime, formatDuration } from "@/lib/utils";
 import { useEventSource } from "@/hooks/use-event-source";
 import { useCachedJson } from "@/hooks/use-cached-json";
+import { clientCacheInvalidate, clientCacheSet } from "@/lib/client/fetch-cache";
+import { fetchJson } from "@/lib/client/fetch-json";
 import type { DashboardMetrics } from "@/lib/services/metrics";
 import { TableSkeleton } from "@/components/ui/table-skeleton";
 
@@ -135,6 +137,7 @@ const selectDashboard = (json: unknown) => json as DashboardMetrics;
 export function OverviewClient({ initialData }: { initialData?: DashboardMetrics } = {}) {
   const {
     data,
+    setData,
     error,
     loading,
     reload: loadDashboard,
@@ -153,9 +156,34 @@ export function OverviewClient({ initialData }: { initialData?: DashboardMetrics
       event.type === "trigger_processed"
     ) {
       setLive(`Live · ${new Date().toLocaleTimeString()}`);
-      void loadDashboard();
+      clientCacheInvalidate("dashboard:");
+      void fetchJson<DashboardMetrics>("/api/dashboard?fresh=1", { retries: 2 })
+        .then((json) => {
+          const next = selectDashboard(json);
+          clientCacheSet("dashboard:metrics", next);
+          setData(next);
+        })
+        .catch(() => loadDashboard());
     }
   });
+
+  // While any investigation is open/running, refresh overview so badges don't stick on Running.
+  const hasOpenRunning = Boolean(
+    data?.openInvestigations?.some((t) => t.status === "running" || t.status === "pending"),
+  );
+  useEffect(() => {
+    if (!hasOpenRunning) return;
+    const id = window.setInterval(() => {
+      void fetchJson<DashboardMetrics>("/api/dashboard?fresh=1", { retries: 2 })
+        .then((json) => {
+          const next = selectDashboard(json);
+          clientCacheSet("dashboard:metrics", next);
+          setData(next);
+        })
+        .catch(() => undefined);
+    }, 2500);
+    return () => window.clearInterval(id);
+  }, [hasOpenRunning, setData]);
 
   const volumeSlice = useMemo(() => {
     if (!data) return [];
@@ -188,7 +216,9 @@ export function OverviewClient({ initialData }: { initialData?: DashboardMetrics
   }
 
   const successTotal =
-    data.charts.successVsFailed.successful + data.charts.successVsFailed.failed;
+    data.charts.successVsFailed.successful +
+    (data.charts.successVsFailed.pending || 0) +
+    data.charts.successVsFailed.failed;
 
   const todayLabel = new Intl.DateTimeFormat("en-US", {
     month: "short",
@@ -387,15 +417,16 @@ export function OverviewClient({ initialData }: { initialData?: DashboardMetrics
 
         <Card className="border-0">
           <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle className="text-base font-semibold">Successful vs failed</CardTitle>
+            <CardTitle className="text-base font-semibold">Task outcomes</CardTitle>
             <MoreHorizontal className="h-4 w-4 text-slate-300" />
           </CardHeader>
           <CardContent className="h-72">
             {successTotal === 0 ? (
-              <EmptyChart text="No success/failure data yet." />
+              <EmptyChart text="No task outcome data yet." />
             ) : (
               <Donut3D
                 successful={data.charts.successVsFailed.successful}
+                pending={data.charts.successVsFailed.pending || 0}
                 failed={data.charts.successVsFailed.failed}
               />
             )}

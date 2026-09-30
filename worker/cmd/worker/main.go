@@ -39,8 +39,16 @@ func main() {
 	log.Printf("supabase OK (%dms) customers=%d orders=%d tasks=%d openTickets=%d",
 		stats.LatencyMs, stats.Customers, stats.Orders, stats.Tasks, stats.OpenTickets)
 
+	if cfg.PreferSimulated {
+		log.Printf("agent mode: simulated fallback (AGENT_PROVIDER=simulated or missing OPENAI_API_KEY)")
+	} else {
+		log.Printf("agent mode: OpenAI (%s) + Go Supabase tools", cfg.OpenAIModel)
+	}
+
 	runner := &agent.Runner{
 		Pool:            pool,
+		OpenAIKey:       cfg.OpenAIKey,
+		OpenAIModel:     cfg.OpenAIModel,
 		PreferSimulated: cfg.PreferSimulated,
 		Timeout:         time.Duration(cfg.TimeoutSeconds) * time.Second,
 	}

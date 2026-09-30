@@ -8,6 +8,11 @@ import { executeTool, getToolDefinitions } from "@/lib/tools";
 import { assertCanRunAgent } from "@/lib/agent/permissions";
 import { ensurePendingApproval } from "@/lib/agent/ensure-approval";
 import { isRestrictedAction } from "@/lib/agent/permissions";
+import {
+  PIPELINE_SYSTEM_RULES,
+  buildInvestigationPrompt,
+  resolvePipeline,
+} from "@/lib/agent/pipeline";
 import { forceFailTask } from "@/lib/agent/reclaim";
 import { publishRealtime } from "@/lib/realtime/events";
 import { cacheInvalidate } from "@/lib/cache/memory";
@@ -58,7 +63,8 @@ Your job:
 7. Customer copy rules: write findings and emails in plain language. Never put snake_case codes (not_shipped, in_production) or ISO timestamps (2026-10-04T09:03:39.144Z) in customer emails — say "has not shipped yet" and "October 4, 2026" instead.
 8. SPEED: When tools are independent, call several in ONE turn (e.g. get_production_status + track_shipment together). Prefer the shortest path: investigate → send_customer_email → record_agent_outcome.
 9. Prefer verified tool results. Always call record_agent_outcome before finishing.
-10. CRITICAL: Your FINAL assistant message (after tools) must be ONLY a single raw JSON object — no markdown, no headings, no bullet lists, no code fences. Exact shape:
+10. ${PIPELINE_SYSTEM_RULES}
+11. CRITICAL: Your FINAL assistant message (after tools) must be ONLY a single raw JSON object — no markdown, no headings, no bullet lists, no code fences. Exact shape:
 {
   "problemIdentified": string,
   "evidenceCollected": string[],
@@ -315,6 +321,26 @@ export async function startInvestigation(input: StartInvestigationInput) {
 
   const orderDbId = input.orderDbId ?? order?.id ?? null;
   const issueType = input.issueType ?? order?.issueType ?? null;
+  const orderNumber = order?.orderNumber || input.orderId || null;
+
+  let prompt = input.prompt;
+  const pipeline = resolvePipeline({
+    issueType,
+    prompt,
+    customerNotes: order?.customerNotes,
+  });
+  const genericDeliveryPrompt =
+    /has not been delivered and determine what should happen next/i.test(prompt) ||
+    /^investigate\b/i.test(prompt.trim());
+  if (orderNumber && (genericDeliveryPrompt || pipeline.kind !== "status_resolve")) {
+    if (genericDeliveryPrompt) {
+      prompt = buildInvestigationPrompt(String(orderNumber), issueType);
+    } else if (pipeline.kind === "require_approval") {
+      prompt = `${prompt}\n\nPIPELINE REQUIREMENT: ${pipeline.reason} You MUST call request_human_approval for ${pipeline.restrictedAction} before finishing. Do not resolve.`;
+    } else if (pipeline.kind === "escalate_claim") {
+      prompt = `${prompt}\n\nPIPELINE REQUIREMENT: ${pipeline.reason}`;
+    }
+  }
 
   const task = await prisma.agentTask.create({
     data: {
@@ -322,9 +348,9 @@ export async function startInvestigation(input: StartInvestigationInput) {
       taskType: input.taskType || "delayed_order_investigation",
       issueType,
       orderId: orderDbId,
-      prompt: input.prompt,
+      prompt,
       status: "running",
-      priority: input.priority || "medium",
+      priority: input.priority || (pipeline.kind === "require_approval" ? "high" : "medium"),
       triggerType: input.triggerType || "manual",
       triggerEventId: input.triggerEventId || null,
       startedAt: new Date(),
@@ -671,6 +697,139 @@ export async function runAgentLoop(taskId: string) {
           remainingRisks: ["Incomplete agent run"],
           finalTaskStatus: "needs_human",
         };
+    }
+
+    // Hard pipeline gate — model cannot skip approval on cancel/refund/address.
+    const policy = resolvePipeline({
+      issueType: task.issueType,
+      orderIssueType: task.order?.issueType,
+      prompt: task.prompt,
+      customerNotes: task.order?.customerNotes,
+      proposedAction: finalResult.proposedOrCompletedAction,
+    });
+
+    const relatedOrderId = task.order?.orderNumber || task.orderId || "UNKNOWN";
+
+    if (policy.kind === "require_approval" && !usedToolNames.includes("create_support_ticket")) {
+      await addStep({
+        stepType: "decision",
+        title: "Pipeline enforcement — open support ticket",
+        detail: "Restricted cases always create an internal ticket for human review.",
+      });
+      const ticketResult = await executeTool(
+        "create_support_ticket",
+        {
+          orderId: relatedOrderId,
+          issueCategory: task.issueType || policy.restrictedAction || "restricted_action",
+          description: `${policy.reason} Task ${task.taskNumber}. ${finalResult.investigationSummary || ""}`.slice(
+            0,
+            1500,
+          ),
+          priority: "high",
+        },
+        { taskId: task.id, executionId: execution.id, actorRole: "agent" },
+      );
+      usedToolNames.push("create_support_ticket");
+      await addStep({
+        stepType: "tool_result",
+        title: "Created support ticket — result",
+        toolName: "create_support_ticket",
+        toolResultJson: JSON.stringify(ticketResult).slice(0, 8000),
+        detail: ticketResult.ok ? "Tool succeeded" : ticketResult.error,
+        status: ticketResult.ok ? "completed" : "error",
+      });
+    }
+
+    if (
+      policy.kind === "require_approval" &&
+      !pauseForApproval &&
+      !usedToolNames.includes("request_human_approval")
+    ) {
+      await addStep({
+        stepType: "decision",
+        title: "Pipeline enforcement — approval required",
+        detail: policy.reason,
+      });
+      const approvalResult = await executeTool(
+        "request_human_approval",
+        {
+          proposedAction: policy.restrictedAction || "cancel_order",
+          reason: policy.reason,
+          relatedOrderId,
+          supportingEvidence: [
+            "pipeline_enforcement",
+            policy.label,
+            ...(finalResult.evidenceCollected || []).slice(0, 5),
+          ],
+        },
+        { taskId: task.id, executionId: execution.id, actorRole: "agent" },
+      );
+      usedToolNames.push("request_human_approval");
+      await addStep({
+        stepType: "tool_result",
+        title: "Requested human approval — result",
+        toolName: "request_human_approval",
+        toolResultJson: JSON.stringify(approvalResult).slice(0, 8000),
+        detail: approvalResult.ok ? "Tool succeeded" : approvalResult.error,
+        status: approvalResult.ok ? "completed" : "error",
+      });
+      if (approvalResult.ok) {
+        pauseForApproval = true;
+        finalResult = {
+          problemIdentified: finalResult.problemIdentified || policy.label,
+          evidenceCollected: finalResult.evidenceCollected?.length
+            ? finalResult.evidenceCollected
+            : ["Order evidence reviewed", "Support ticket opened", "Restricted action gated"],
+          investigationSummary:
+            finalResult.investigationSummary ||
+            "Investigation complete. Support ticket opened; restricted action awaiting human approval.",
+          rootCause: finalResult.rootCause,
+          proposedOrCompletedAction: `Opened support ticket and requested approval: ${policy.restrictedAction}`,
+          approvalRequired: true,
+          customerResponse: finalResult.customerResponse,
+          remainingRisks: ["Action not executed until approved"],
+          finalTaskStatus: "awaiting_approval",
+        };
+        emitTaskStatus("awaiting_approval");
+      }
+    } else if (
+      policy.kind === "escalate_claim" &&
+      !usedToolNames.includes("escalate_task") &&
+      !pauseForApproval &&
+      finalResult.finalTaskStatus === "resolved"
+    ) {
+      await addStep({
+        stepType: "decision",
+        title: "Pipeline enforcement — escalate claim",
+        detail: policy.reason,
+      });
+      const esc = await executeTool(
+        "escalate_task",
+        {
+          taskId: "CURRENT",
+          escalationReason: policy.reason,
+          supportingEvidence: finalResult.evidenceCollected || [],
+          recommendedNextStep: "Human review of delivered-not-received claim; do not auto-refund.",
+        },
+        { taskId: task.id, executionId: execution.id, actorRole: "agent" },
+      );
+      usedToolNames.push("escalate_task");
+      await addStep({
+        stepType: "tool_result",
+        title: "Escalated task — result",
+        toolName: "escalate_task",
+        toolResultJson: JSON.stringify(esc).slice(0, 8000),
+        detail: esc.ok ? "Tool succeeded" : esc.error,
+        status: esc.ok ? "completed" : "error",
+      });
+      if (esc.ok) {
+        finalResult = {
+          ...finalResult,
+          proposedOrCompletedAction: "Escalated delivered-not-received claim for human review",
+          approvalRequired: true,
+          finalTaskStatus: "escalated",
+        };
+      }
     }
 
     finalResult = normalizeFinalResult(finalResult, usedToolNames, pauseForApproval);

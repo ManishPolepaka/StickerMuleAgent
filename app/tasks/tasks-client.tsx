@@ -103,15 +103,10 @@ export function TasksClient({ initialTasks }: { initialTasks?: TaskListItem[] } 
     }
   });
 
-  // Debug-only polling (localStorage.debugAgent=1). Avoids fighting the DB pool in normal runs.
+  // Keep list badges in sync while any task is Running (Go worker may not hit SSE).
   const hasRunning = tasks.some((t) => t.status === "running");
   useEffect(() => {
     if (!hasRunning) return;
-    try {
-      if (window.localStorage.getItem("debugAgent") !== "1") return;
-    } catch {
-      return;
-    }
     agentDebug("tasks-list", "polling while tasks are running");
     const id = window.setInterval(() => {
       const cached = clientCachePeek<TaskListItem[]>("tasks:list") || [];
@@ -121,7 +116,7 @@ export function TasksClient({ initialTasks }: { initialTasks?: TaskListItem[] } 
         `poll refresh · still running: ${running.map((t) => t.taskNumber).join(", ") || "none"}`,
       );
       load();
-    }, 4000);
+    }, 2500);
     return () => window.clearInterval(id);
   }, [hasRunning, load]);
 

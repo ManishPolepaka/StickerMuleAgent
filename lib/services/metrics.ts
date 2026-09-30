@@ -35,9 +35,13 @@ export async function getDashboardMetrics(): Promise<DashboardMetrics> {
   return refreshDashboard();
 }
 
-/** Force a fresh compute (used by server warm-up). */
+/** Force a fresh compute (used by server warm-up and ?fresh=1). */
 export async function warmDashboardMetrics(): Promise<void> {
   await refreshDashboard();
+}
+
+export async function refreshDashboardMetrics(): Promise<DashboardMetrics> {
+  return refreshDashboard();
 }
 
 async function computeDashboardMetrics() {
@@ -111,11 +115,16 @@ async function computeDashboardMetrics() {
         )
       : 0;
 
-  const successFail = { successful: 0, failed: 0 };
-  for (const e of executions) {
-    if (e.status === "completed" || e.status === "awaiting_approval") successFail.successful += 1;
-    if (e.status === "failed") successFail.failed += 1;
-  }
+  const successFail = {
+    successful: countByStatus.get("resolved") || 0,
+    pending:
+      (countByStatus.get("running") || 0) +
+      (countByStatus.get("pending") || 0) +
+      (countByStatus.get("awaiting_approval") || 0) +
+      (countByStatus.get("escalated") || 0) +
+      (countByStatus.get("needs_human") || 0),
+    failed: countByStatus.get("failed") || 0,
+  };
 
   const byDay = new Map<string, { total: number; resolved: number; human: number }>();
   for (const t of allTasks) {

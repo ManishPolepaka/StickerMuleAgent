@@ -56,6 +56,26 @@ export function createSimulatedProvider(): ModelProvider {
       const wantsAddress = /address|change shipping|fix the shipping/.test(lower);
       const invalidOrder = orderId?.includes("DOES-NOT-EXIST") || orderId === "ORD-INVALID";
 
+      // Also honor order.issueType from tool results (manual prompts often omit "cancel").
+      const orderIssue = (() => {
+        for (const r of results) {
+          try {
+            const parsed = JSON.parse(r) as {
+              data?: { order?: { issueType?: string }; issueType?: string };
+            };
+            return parsed.data?.order?.issueType || parsed.data?.issueType || "";
+          } catch {
+            /* ignore */
+          }
+        }
+        return "";
+      })();
+      const restrictedByIssue =
+        orderIssue === "cancel_request" ||
+        orderIssue === "refund_request" ||
+        orderIssue === "incorrect_address" ||
+        /cancel_request|refund_request|incorrect_address/.test(lower);
+
       if (!orderId && !invalidOrder) {
         return {
           content: null,
@@ -168,7 +188,11 @@ export function createSimulatedProvider(): ModelProvider {
           );
         }
         // Customer history only when refund/cancel/address — saves a round on status demos.
-        if ((wantsRefund || wantsCancel || wantsAddress) && customerId && !used.has("get_customer_history")) {
+        if (
+          (wantsRefund || wantsCancel || wantsAddress || restrictedByIssue) &&
+          customerId &&
+          !used.has("get_customer_history")
+        ) {
           batch.push(makeCall("get_customer_history", { customerId }));
         }
         if (batch.length) {
@@ -182,11 +206,11 @@ export function createSimulatedProvider(): ModelProvider {
         }
       }
 
-      if (wantsRefund || wantsCancel || wantsAddress) {
+      if (wantsRefund || wantsCancel || wantsAddress || restrictedByIssue) {
         if (!used.has("request_human_approval")) {
-          const action = wantsRefund
+          const action = wantsRefund || orderIssue === "refund_request"
             ? "issue_refund"
-            : wantsCancel
+            : wantsCancel || orderIssue === "cancel_request"
               ? "cancel_order"
               : "change_shipping_address";
           return {

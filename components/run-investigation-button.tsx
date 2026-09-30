@@ -17,13 +17,16 @@ import {
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { agentDebug, agentDebugWarn } from "@/lib/client/agent-debug";
+import { buildInvestigationPrompt } from "@/lib/agent/pipeline";
 
 type OrderOption = { orderNumber: string; issueType: string | null };
 
 export function RunInvestigationButton({
   defaultOrderNumber,
+  defaultIssueType,
 }: {
   defaultOrderNumber?: string;
+  defaultIssueType?: string | null;
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -31,7 +34,7 @@ export function RunInvestigationButton({
   const [orderId, setOrderId] = useState(defaultOrderNumber || "");
   const [prompt, setPrompt] = useState(
     defaultOrderNumber
-      ? `Investigate why order ${defaultOrderNumber} has not been delivered and determine what should happen next.`
+      ? buildInvestigationPrompt(defaultOrderNumber, defaultIssueType ?? null)
       : "",
   );
   const [loading, setLoading] = useState(false);
@@ -101,9 +104,8 @@ export function RunInvestigationButton({
                 const v = e.target.value;
                 setOrderId(v);
                 if (v) {
-                  setPrompt(
-                    `Investigate why order ${v} has not been delivered and determine what should happen next.`,
-                  );
+                  const issue = orders.find((o) => o.orderNumber === v)?.issueType ?? null;
+                  setPrompt(buildInvestigationPrompt(v, issue));
                 }
               }}
             >

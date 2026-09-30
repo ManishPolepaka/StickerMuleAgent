@@ -6,6 +6,7 @@ import {
   clientCacheSet,
   subscribeClientCache,
 } from "@/lib/client/fetch-cache";
+import { fetchJson } from "@/lib/client/fetch-json";
 
 /** Safe cache read: undefined on server/hydration, live value after hydrate. */
 export function useClientCacheSnapshot<T>(key: string): T | undefined {
@@ -35,10 +36,8 @@ export function useCachedJson<T>(
   const [loading, setLoading] = useState<boolean>(initial === undefined && cached === undefined);
 
   const reload = useCallback(() => {
-    return fetch(url, { cache: "no-store" })
-      .then(async (r) => {
-        const json = await r.json();
-        if (!r.ok) throw new Error((json as { error?: string }).error || "Request failed");
+    return fetchJson(url, { retries: 3 })
+      .then((json) => {
         const next = selectRef.current(json);
         clientCacheSet(key, next);
         setData(next);
@@ -47,8 +46,21 @@ export function useCachedJson<T>(
         return next;
       })
       .catch((e) => {
-        setError(e instanceof Error ? e.message : "Request failed");
+        // Keep showing cached/initial data during transient Fast Refresh 404s.
         setLoading(false);
+        setData((prev) => {
+          if (prev !== undefined) {
+            setError(null);
+            return prev;
+          }
+          const peek = clientCachePeek<T>(key);
+          if (peek !== undefined) {
+            setError(null);
+            return peek;
+          }
+          setError(e instanceof Error ? e.message : "Request failed");
+          return prev;
+        });
       });
   }, [key, url]);
 

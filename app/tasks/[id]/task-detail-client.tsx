@@ -17,7 +17,8 @@ import {
   extractDraftEmail,
   humanizeSummary,
 } from "@/lib/ui/task-presentation";
-import { clientCacheSet } from "@/lib/client/fetch-cache";
+import { clientCachePeek, clientCacheSet } from "@/lib/client/fetch-cache";
+import { fetchJson } from "@/lib/client/fetch-json";
 import { agentDebug, agentDebugWarn } from "@/lib/client/agent-debug";
 import { useClientCacheSnapshot } from "@/hooks/use-cached-json";
 import { TableSkeleton } from "@/components/ui/table-skeleton";
@@ -121,10 +122,8 @@ export function TaskDetailClient({
   useEffect(() => {
     let alive = true;
     agentDebug("task-detail", `loading ${taskId}`);
-    fetch(`/api/tasks/${taskId}`)
-      .then(async (r) => {
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || "Failed to load task");
+    fetchJson<{ task: TaskDetail }>(`/api/tasks/${taskId}`, { retries: 3 })
+      .then((d) => {
         if (!alive) return;
         agentDebug("task-detail", "loaded", {
           taskNumber: d.task?.taskNumber,
@@ -139,6 +138,11 @@ export function TaskDetailClient({
       .catch((e) => {
         if (!alive) return;
         agentDebugWarn("task-detail", "load failed", e);
+        // Don't wipe a good cached task with a transient Fast Refresh 404.
+        if (cachedTask || task) {
+          setLoadError(null);
+          return;
+        }
         setLoadError(e instanceof Error ? e.message : "Failed to load task");
       });
     return () => {
@@ -183,8 +187,7 @@ export function TaskDetailClient({
     }
     if (event.type === "task_updated" || event.type === "approval_requested") {
       agentDebug("task-detail", String(event.type), event);
-      fetch(`/api/tasks/${taskId}`)
-        .then((r) => r.json())
+      fetchJson<{ task?: TaskDetail }>(`/api/tasks/${taskId}`, { retries: 2 })
         .then((data) => {
           if (data.task) {
             agentDebug("task-detail", "refreshed after event", {
@@ -194,18 +197,14 @@ export function TaskDetailClient({
             setTask(data.task);
             clientCacheSet(cacheKey, data.task);
           }
-        });
+        })
+        .catch((err) => agentDebugWarn("task-detail", "refresh after event failed", err));
     }
   });
 
-  // Debug-only poll while Running (enable with localStorage.debugAgent='1').
+  // Keep detail in sync while Running — Go worker writes DB directly; SSE can miss events.
   useEffect(() => {
     if (task?.status !== "running") return;
-    try {
-      if (window.localStorage.getItem("debugAgent") !== "1") return;
-    } catch {
-      return;
-    }
     agentDebug("task-detail", "start running poll", {
       taskNumber: task.taskNumber,
       steps: task.executions?.[0]?.steps?.length ?? 0,
@@ -213,8 +212,7 @@ export function TaskDetailClient({
     const startedAt = Date.now();
     const id = window.setInterval(() => {
       const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-      fetch(`/api/tasks/${taskId}`)
-        .then((r) => r.json())
+      fetchJson<{ task?: TaskDetail }>(`/api/tasks/${taskId}`, { retries: 2 })
         .then((data) => {
           if (!data.task) return;
           const stepsCount = data.task.executions?.[0]?.steps?.length ?? 0;
@@ -235,9 +233,21 @@ export function TaskDetailClient({
           }
           setTask(data.task);
           clientCacheSet(cacheKey, data.task);
+          // Keep tasks list badge in sync when this tab observes a terminal status.
+          if (data.task.status !== "running") {
+            const list = clientCachePeek<Array<{ id: string; status: string }>>("tasks:list");
+            if (list) {
+              clientCacheSet(
+                "tasks:list",
+                list.map((t) =>
+                  t.id === data.task!.id ? { ...t, status: data.task!.status } : t,
+                ),
+              );
+            }
+          }
         })
         .catch((err) => agentDebugWarn("task-detail", "poll failed", err));
-    }, 3000);
+    }, 2000);
     return () => window.clearInterval(id);
   }, [task?.status, task?.taskNumber, taskId, cacheKey]);
 
@@ -428,11 +438,25 @@ export function TaskDetailClient({
               <div className="space-y-3 text-sm">
                 <p className="text-xs text-slate-500">
                   What would go to the customer — separate from the internal summary.
-                  {(task.emails?.length ?? 0) === 0
-                    ? " Draft only (not sent)."
-                    : " A simulated send was recorded below."}
+                  {(task.emails?.length ?? 0) > 0
+                    ? " Simulated send is shown below."
+                    : draft
+                      ? " Draft only (not sent)."
+                      : ""}
                 </p>
-                {draft ? (
+                {(task.emails || []).map((e) => (
+                  <div key={e.id} className="rounded-xl border border-amber-100 bg-amber-50 p-3">
+                    <div className="text-xs font-medium text-amber-800">
+                      Simulated send · {e.provider} · {e.status}
+                    </div>
+                    <div className="mt-1 font-medium">{e.subject}</div>
+                    <div className="text-xs text-slate-500">{e.toEmail}</div>
+                    {e.body ? (
+                      <div className="mt-3 whitespace-pre-wrap text-slate-700">{e.body}</div>
+                    ) : null}
+                  </div>
+                ))}
+                {draft && (task.emails?.length ?? 0) === 0 ? (
                   <div className="rounded-xl border border-slate-100 bg-slate-50 p-4">
                     <div className="text-xs uppercase tracking-wide text-slate-400">To</div>
                     <div>{draft.to || task.order?.customer.email}</div>
@@ -443,15 +467,15 @@ export function TaskDetailClient({
                     <div className="mt-3 whitespace-pre-wrap text-slate-700">{draft.body}</div>
                   </div>
                 ) : null}
-                {(task.emails || []).map((e) => (
-                  <div key={e.id} className="rounded-xl border border-amber-100 bg-amber-50 p-3">
-                    <div className="text-xs font-medium text-amber-800">
-                      Simulated send · {e.provider} · {e.status}
-                    </div>
-                    <div className="mt-1 font-medium">{e.subject}</div>
-                    <div className="text-xs text-slate-500">{e.toEmail}</div>
-                  </div>
-                ))}
+                {draft && (task.emails?.length ?? 0) > 0 ? (
+                  <details className="rounded-xl border border-slate-100 bg-white p-3">
+                    <summary className="cursor-pointer text-xs font-medium text-slate-500">
+                      Earlier draft (not used for send)
+                    </summary>
+                    <div className="mt-2 font-medium">{draft.subject}</div>
+                    <div className="mt-2 whitespace-pre-wrap text-slate-700">{draft.body}</div>
+                  </details>
+                ) : null}
                 {!hasReply ? (
                   <p className="text-sm text-slate-500">No customer reply drafted yet.</p>
                 ) : null}

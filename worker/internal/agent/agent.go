@@ -4,27 +4,79 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/ManishPolepaka/StickerMuleAgent/worker/internal/notify"
+	"github.com/ManishPolepaka/StickerMuleAgent/worker/internal/openai"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const systemPrompt = `You are the Order Operations Agent for CommerceOps AI, a DEMO e-commerce operations platform.
+All business data and carrier/production/email integrations are simulated demo systems — never claim they are real Sticker Mule systems.
+
+Your job:
+1. Investigate delayed or problematic orders using tools only.
+2. Never invent order information, delivery dates, refunds, discounts, or action success.
+3. If evidence is insufficient, say so and escalate.
+4. AUTO-ALLOWED (do these yourself — do NOT call request_human_approval):
+   - Read order / production / shipping / customer history
+   - Draft AND send status/update emails via send_customer_email (simulated)
+   - Create support tickets
+   - Escalate for more evidence
+   - Record investigation outcomes
+5. RESTRICTED (MUST use request_human_approval — never execute yourself):
+   - Refunds, credits, discounts, cancellations, shipping-address changes, compensation promises
+6. For normal delivery/status inquiries: investigate → send_customer_email with a verified update → record_agent_outcome with finalTaskStatus "resolved" and approvalRequired false.
+7. Customer copy rules: write findings and emails in plain language. Never put snake_case codes (not_shipped, in_production) or ISO timestamps in customer emails.
+8. SPEED: When tools are independent, call several in ONE turn. Prefer the shortest path: investigate → send_customer_email → record_agent_outcome.
+9. Prefer verified tool results. Always call record_agent_outcome before finishing.
+10. ISSUE-TYPE PIPELINES (follow the order's issueType / customer notes, not just the user prompt):
+   - cancel_request → investigate → create_support_ticket → optional "under review" status email → request_human_approval(cancel_order) → awaiting_approval
+   - refund_request → investigate → create_support_ticket → request_human_approval(issue_refund) → awaiting_approval
+   - incorrect_address → investigate → create_support_ticket → request_human_approval(change_shipping_address) → awaiting_approval
+   - production_delay / missing_tracking / stale_tracking / delivery_status_inquiry → investigate → send_customer_email (direct customer answer) → record_agent_outcome(resolved)
+   - delivered_not_received → investigate → create_support_ticket → careful status email (no refund) → escalate_task
+   Restricted cases ALWAYS open an internal support ticket for the human reviewer.
+   Status cases: answer the customer directly after verified analysis — no approval needed.
+   Never resolve a cancel/refund/address/credit/discount/compensation case without request_human_approval.
+   Never ask the customer to "choose" cancel vs wait as a substitute for approval.
+11. CRITICAL: Your FINAL assistant message (after tools) must be ONLY a single raw JSON object — no markdown, no headings, no bullet lists, no code fences. Exact shape:
+{
+  "problemIdentified": string,
+  "evidenceCollected": string[],
+  "investigationSummary": string,
+  "rootCause": string|null,
+  "proposedOrCompletedAction": string,
+  "approvalRequired": boolean,
+  "customerResponse": string|null,
+  "remainingRisks": string[],
+  "finalTaskStatus": "resolved"|"awaiting_approval"|"escalated"|"failed"|"needs_human"
+}`
+
 type Runner struct {
 	Pool            *pgxpool.Pool
+	OpenAIKey       string
+	OpenAIModel     string
 	PreferSimulated bool
 	Timeout         time.Duration
 }
 
 type runState struct {
-	taskID      string
-	taskNumber  string
-	prompt      string
-	orderID     *string
-	orderNumber string
-	execID      string
-	stepIndex   int
+	taskID        string
+	taskNumber    string
+	prompt        string
+	issueType     string
+	customerNotes string
+	orderID       *string
+	orderNumber   string
+	execID        string
+	stepIndex     int
+	promptTok     int
+	compTok       int
+	started       time.Time
 }
 
 func (r *Runner) RunTask(ctx context.Context, taskID string) error {
@@ -33,36 +85,75 @@ func (r *Runner) RunTask(ctx context.Context, taskID string) error {
 
 	var st runState
 	st.taskID = taskID
+	st.started = time.Now()
 	var orderID *string
+	var taskIssue, orderIssue, notes string
 	err := r.Pool.QueryRow(ctx, `
-		select t.id, t."taskNumber", t.prompt, t."orderId", coalesce(o."orderNumber", '')
+		select t.id, t."taskNumber", t.prompt, t."orderId",
+		       coalesce(t."issueType", ''), coalesce(o."issueType", ''),
+		       coalesce(o."orderNumber", ''), coalesce(o."customerNotes", '')
 		from "AgentTask" t
 		left join "Order" o on o.id = t."orderId"
-		where t.id = $1`, taskID).Scan(&st.taskID, &st.taskNumber, &st.prompt, &orderID, &st.orderNumber)
+		where t.id = $1`, taskID).Scan(
+		&st.taskID, &st.taskNumber, &st.prompt, &orderID,
+		&taskIssue, &orderIssue, &st.orderNumber, &notes)
 	if err != nil {
 		return fmt.Errorf("load task: %w", err)
 	}
 	st.orderID = orderID
+	st.customerNotes = notes
+	st.issueType = firstNonEmpty(taskIssue, orderIssue)
 
 	_, _ = r.Pool.Exec(ctx, `
 		update "AgentTask"
 		set status = 'running', "startedAt" = coalesce("startedAt", now())
 		where id = $1`, taskID)
+	notify.TaskUpdated(st.taskID, st.taskNumber, "running")
+
+	useOpenAI := !r.PreferSimulated && strings.TrimSpace(r.OpenAIKey) != ""
+	provider := "openai"
+	model := firstNonEmpty(r.OpenAIModel, "gpt-5-mini")
+	if !useOpenAI {
+		provider = "go-worker"
+		model = "go-simulated-v1"
+	}
 
 	st.execID = newID()
 	_, err = r.Pool.Exec(ctx, `
 		insert into "AgentExecution"
 			(id, "taskId", "agentName", "modelProvider", "modelName", "inputSummary", status, "createdAt")
-		values ($1,$2,'Order Operations Agent','go-worker','go-simulated-v1',$3,'running',now())`,
-		st.execID, taskID, truncate(st.prompt, 500))
+		values ($1,$2,'Order Operations Agent',$3,$4,$5,'running',now())`,
+		st.execID, taskID, provider, model, truncate(st.prompt, 500))
 	if err != nil {
 		_ = r.failTask(ctx, &st, fmt.Sprintf("create execution: %v", err))
 		return err
 	}
 
-	if err := r.addStep(ctx, &st, "lifecycle", "Investigation started", "Provider: Go worker (simulated tools)", "", ""); err != nil {
+	detail := "Provider: OpenAI — Go worker fetches Supabase data via tools"
+	if !useOpenAI {
+		detail = "Provider: Go worker simulated fallback (no OPENAI_API_KEY)"
+	}
+	if err := r.addStep(ctx, &st, "lifecycle", "Investigation started", detail, "", ""); err != nil {
 		_ = r.failTask(ctx, &st, err.Error())
 		return err
+	}
+
+	if useOpenAI {
+		if err := r.runOpenAI(ctx, &st); err != nil {
+			log.Printf("openai path failed for %s: %v — falling back to simulated", st.taskNumber, err)
+			_, _ = r.Pool.Exec(ctx, `
+				update "AgentExecution"
+				set "modelProvider" = 'openai-fallback', "modelName" = 'go-simulated-v1', "errorMessage" = $2
+				where id = $1`, st.execID, truncate(err.Error(), 1500))
+			_ = r.addStep(ctx, &st, "lifecycle", "Switched to simulated provider",
+				fmt.Sprintf("OpenAI failed (%s); finishing with deterministic Supabase tool path.", truncate(err.Error(), 240)), "", "")
+			if simErr := r.runSimulated(ctx, &st); simErr != nil {
+				_ = r.failTask(ctx, &st, simErr.Error())
+				return simErr
+			}
+			return nil
+		}
+		return nil
 	}
 
 	if err := r.runSimulated(ctx, &st); err != nil {
@@ -72,277 +163,307 @@ func (r *Runner) RunTask(ctx context.Context, taskID string) error {
 	return nil
 }
 
-func (r *Runner) runSimulated(ctx context.Context, st *runState) error {
-	if st.orderNumber == "" {
-		return r.failTask(ctx, st, "No order linked to this task")
+func (r *Runner) runOpenAI(ctx context.Context, st *runState) error {
+	client := openai.New(r.OpenAIKey, r.OpenAIModel)
+	orderHint := ""
+	if st.orderNumber != "" {
+		orderHint = fmt.Sprintf("Related order: %s.", st.orderNumber)
+	}
+	messages := []openai.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: fmt.Sprintf("%s\n\n%s\nInternal taskId for tools that need it: %s (you may pass \"CURRENT\" as taskId).",
+			st.prompt, orderHint, st.taskID)},
 	}
 
-	order, err := r.getOrder(ctx, st.orderNumber)
-	if err != nil {
-		return err
-	}
-	if err := r.addStep(ctx, st, "tool_result", "Retrieved order details",
-		fmt.Sprintf("Found order %s. Status: %s; shipping: %s.", order.OrderNumber, order.OrderStatus, order.ShippingStatus),
-		"get_order_details", mustJSON(order)); err != nil {
-		return err
-	}
+	tools := toolDefinitions()
+	maxIter := 12
+	paused := false
+	var final map[string]any
+	usedTools := []string{}
 
-	prod, err := r.getProduction(ctx, order.ID)
-	if err != nil {
-		return err
-	}
-	detail := fmt.Sprintf("Production stage: %s.", prod.Stage)
-	if prod.DelayReported {
-		detail = fmt.Sprintf("Production is delayed — %s. Stage: %s.", coalesce(prod.DelayReason, "delay reported"), prod.Stage)
-	}
-	if err := r.addStep(ctx, st, "tool_result", "Checked production status", detail, "get_production_status", mustJSON(prod)); err != nil {
-		return err
-	}
-
-	ship, err := r.getShipment(ctx, order.ID, order.TrackingNumber)
-	if err != nil {
-		return err
-	}
-	shipDetail := fmt.Sprintf("Shipment status: %s.", ship.Status)
-	if ship.TrackingNumber == "" {
-		shipDetail = "No tracking number on this order yet."
-	}
-	if err := r.addStep(ctx, st, "tool_result", "Checked shipment tracking", shipDetail, "track_shipment", mustJSON(ship)); err != nil {
-		return err
-	}
-
-	cust, err := r.getCustomer(ctx, order.CustomerID)
-	if err != nil {
-		return err
-	}
-	if err := r.addStep(ctx, st, "tool_result", "Reviewed customer history",
-		fmt.Sprintf("Customer %s · %d recent orders.", cust.Name, cust.RecentOrderCount),
-		"get_customer_history", mustJSON(cust)); err != nil {
-		return err
-	}
-
-	lower := strings.ToLower(st.prompt)
-	wantsRefund := strings.Contains(lower, "refund") || strings.Contains(lower, "credit")
-	wantsCancel := strings.Contains(lower, "cancel")
-	wantsAddress := strings.Contains(lower, "address")
-
-	if wantsRefund || wantsCancel || wantsAddress {
-		action := "issue_refund"
-		if wantsCancel {
-			action = "cancel_order"
-		} else if wantsAddress {
-			action = "change_shipping_address"
+	for i := 0; i < maxIter; i++ {
+		if ctx.Err() != nil {
+			return fmt.Errorf("agent execution timed out")
 		}
-		approvalID := newID()
-		_, err = r.Pool.Exec(ctx, `
-			insert into "HumanApproval"
-				(id, "taskId", "proposedAction", reason, "evidenceJson", status, "idempotencyKey", "createdAt", "updatedAt")
-			values ($1,$2,$3,$4,$5,'pending',$6,now(),now())`,
-			approvalID, st.taskID, action,
-			fmt.Sprintf("Customer or operator requested %s, which requires human approval.", strings.ReplaceAll(action, "_", " ")),
-			mustJSON(map[string]any{"orderNumber": order.OrderNumber, "source": "go_worker"}),
-			fmt.Sprintf("%s:%s", st.taskID, action),
-		)
+		log.Printf("[go-agent] %s iteration %d/%d model=%s", st.taskNumber, i+1, maxIter, client.Model)
+
+		resp, err := client.Complete(ctx, messages, tools)
 		if err != nil {
 			return err
 		}
-		_, _ = r.Pool.Exec(ctx, `
-			update "AgentTask"
-			set status = 'awaiting_approval',
-			    "requiresHumanApproval" = true,
-			    "selectedAction" = $2,
-			    "investigationSummary" = $3,
-			    "completedAt" = null
-			where id = $1`, st.taskID, action, "Investigation complete. Restricted action awaiting human approval.")
-		_ = r.addStep(ctx, st, "tool_result", "Requested human approval",
-			fmt.Sprintf("Paused for approval: %s", action), "request_human_approval", "")
-		_ = r.finishExecution(ctx, st, "awaiting_approval")
-		return nil
+		st.promptTok += resp.Usage.PromptTokens
+		st.compTok += resp.Usage.CompletionTokens
+
+		if len(resp.ToolCalls) > 0 {
+			messages = append(messages, openai.Message{
+				Role:      "assistant",
+				Content:   resp.Content,
+				ToolCalls: resp.ToolCalls,
+			})
+			for _, call := range resp.ToolCalls {
+				usedTools = append(usedTools, call.Name)
+				_ = r.addStep(ctx, st, "tool_call", titleForTool(call.Name),
+					"Calling "+call.Name, call.Name, mustJSON(call.Arguments))
+
+				result := r.executeTool(ctx, st, call.Name, call.Arguments)
+				status := "completed"
+				detail := summarizeToolResult(call.Name, result)
+				if !result.OK {
+					status = "error"
+					detail = result.Error
+				}
+				_ = r.addStepFull(ctx, st, "tool_result", titleForTool(call.Name)+" — result",
+					detail, call.Name, mustJSON(result), status)
+
+				messages = append(messages, openai.Message{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content:    mustJSON(result),
+				})
+
+				if call.Name == "request_human_approval" && result.OK {
+					if data, ok := result.Data.(map[string]any); ok {
+						if pause, _ := data["pauseExecution"].(bool); pause {
+							paused = true
+						}
+					}
+				}
+			}
+			if paused {
+				final = map[string]any{
+					"problemIdentified":         "Restricted action requires approval",
+					"evidenceCollected":         []string{"Approval request created"},
+					"investigationSummary":      "Agent paused for human approval.",
+					"rootCause":                 nil,
+					"proposedOrCompletedAction": "Awaiting human approval",
+					"approvalRequired":          true,
+					"customerResponse":          nil,
+					"remainingRisks":            []string{},
+					"finalTaskStatus":           "awaiting_approval",
+				}
+				break
+			}
+			continue
+		}
+
+		// Final text response from the model
+		messages = append(messages, openai.Message{Role: "assistant", Content: resp.Content})
+		final = tryParseFinal(resp.Content)
+		if final == nil {
+			final = synthesizeFinal(usedTools, paused)
+		}
+		break
 	}
 
-	// Status path: ticket + simulated email + resolve
-	findings := []string{"We reviewed your order using available order and shipping records."}
-	if prod.DelayReported {
-		findings = []string{
-			"Your order is still in production",
-			"Production is delayed due to a material shortage",
-			"The order has not shipped yet",
-		}
-	} else if order.TrackingNumber == nil || *order.TrackingNumber == "" {
-		findings = []string{
-			"Your order has not shipped yet",
-			"Tracking is not available yet",
-		}
+	if final == nil {
+		final = synthesizeFinal(usedTools, paused)
+	}
+	if paused {
+		final["approvalRequired"] = true
+		final["finalTaskStatus"] = "awaiting_approval"
 	}
 
-	ticketID := newID()
-	category := "delivery_status_inquiry"
-	if prod.DelayReported {
-		category = "production_delay"
-	}
-	_, err = r.Pool.Exec(ctx, `
-		insert into "SupportTicket"
-			(id, "orderId", "customerId", category, description, priority, status, "createdBy", "createdAt", "updatedAt")
-		values ($1,$2,$3,$4,$5,'medium','open','order_operations_agent',now(),now())`,
-		ticketID, order.ID, order.CustomerID, category,
-		fmt.Sprintf("Automated investigation finding for %s", order.OrderNumber))
+	var err error
+	final, paused, err = r.enforcePipeline(ctx, st, usedTools, paused, final)
 	if err != nil {
 		return err
 	}
-	_ = r.addStep(ctx, st, "tool_result", "Created support ticket",
-		fmt.Sprintf("Opened internal ticket (%s).", category), "create_support_ticket",
-		mustJSON(map[string]any{"ticketId": ticketID, "category": category}))
-
-	emailID := newID()
-	subject := fmt.Sprintf("Update on your order %s", order.OrderNumber)
-	body := buildEmail(cust.Name, order.OrderNumber, findings)
-	_, err = r.Pool.Exec(ctx, `
-		insert into "SimulatedEmail"
-			(id, "taskId", "orderId", "toEmail", subject, body, status, provider, "createdAt")
-		values ($1,$2,$3,$4,$5,$6,'simulated_sent','go_worker_simulated',now())`,
-		emailID, st.taskID, order.ID, cust.Email, "[SIMULATED] "+subject, body)
-	if err != nil {
-		return err
+	if paused {
+		final["approvalRequired"] = true
+		final["finalTaskStatus"] = "awaiting_approval"
 	}
-	_ = r.addStep(ctx, st, "tool_result", "Sent simulated customer email",
-		"Status email stored as simulated send.", "send_customer_email",
-		mustJSON(map[string]any{"emailId": emailID}))
 
-	final := map[string]any{
-		"problemIdentified":          pickProblem(prod, order),
-		"evidenceCollected":          []string{"Order details retrieved", "Production checked", "Shipment checked", "Simulated status email sent"},
-		"investigationSummary":       "Go worker completed a tool-using investigation using verified database evidence.",
-		"rootCause":                  prod.DelayReason,
-		"proposedOrCompletedAction":  "Sent simulated customer status email and created support ticket where applicable",
-		"approvalRequired":           false,
-		"customerResponse":           "Simulated status email sent from verified findings",
-		"remainingRisks":             []string{},
-		"finalTaskStatus":            "resolved",
+	return r.persistFinal(ctx, st, final)
+}
+
+func (r *Runner) persistFinal(ctx context.Context, st *runState, final map[string]any) error {
+	status, _ := final["finalTaskStatus"].(string)
+	if status == "" {
+		status = "resolved"
 	}
-	finalJSON := mustJSON(final)
-	_, err = r.Pool.Exec(ctx, `
+	summary, _ := final["investigationSummary"].(string)
+	if summary == "" {
+		summary = "OpenAI investigation completed using Supabase evidence."
+	}
+	problem, _ := final["problemIdentified"].(string)
+	action, _ := final["proposedOrCompletedAction"].(string)
+	approval, _ := final["approvalRequired"].(bool)
+
+	// Don't overwrite awaiting_approval / escalated already set by tools.
+	var current string
+	_ = r.Pool.QueryRow(ctx, `select status from "AgentTask" where id = $1`, st.taskID).Scan(&current)
+	if current == "awaiting_approval" || current == "escalated" {
+		status = current
+		approval = true
+	}
+
+	_, err := r.Pool.Exec(ctx, `
 		update "AgentTask"
-		set status = 'resolved',
-		    "investigationSummary" = $2,
-		    "reasoningSummary" = $3,
-		    "finalResultJson" = $4,
-		    "actionResult" = $5,
-		    "completedAt" = now(),
-		    "requiresHumanApproval" = false
+		set status = $2,
+		    "investigationSummary" = $3,
+		    "reasoningSummary" = $4,
+		    "finalResultJson" = $5,
+		    "actionResult" = $6,
+		    "requiresHumanApproval" = $7,
+		    "completedAt" = case when $2 in ('awaiting_approval') then null else now() end
 		where id = $1`,
-		st.taskID,
-		final["investigationSummary"],
-		final["problemIdentified"],
-		finalJSON,
-		final["proposedOrCompletedAction"])
+		st.taskID, status, summary, problem, mustJSON(final), action, approval)
 	if err != nil {
 		return err
 	}
-	_ = r.finishExecution(ctx, st, "completed")
-	_ = r.addStep(ctx, st, "lifecycle", "Investigation completed", "Task resolved by Go worker.", "record_agent_outcome", finalJSON)
+	notify.TaskUpdated(st.taskID, st.taskNumber, status)
+
+	dur := int(time.Since(st.started).Milliseconds())
+	total := st.promptTok + st.compTok
+	cost := estimateCost(firstNonEmpty(r.OpenAIModel, "gpt-5-mini"), st.promptTok, st.compTok)
+	_, _ = r.Pool.Exec(ctx, `
+		update "AgentExecution"
+		set status = $2, "completedAt" = now(), "outputSummary" = $3,
+		    "promptTokens" = $4, "completionTokens" = $5, "totalTokens" = $6,
+		    "estimatedCostUsd" = $7, "durationMs" = $8
+		where id = $1`,
+		st.execID, mapExecStatus(status), truncate(summary, 500),
+		st.promptTok, st.compTok, total, cost, dur)
+
+	_ = r.addStep(ctx, st, "lifecycle", "Investigation completed",
+		fmt.Sprintf("OpenAI finished with status %s.", status), "record_agent_outcome", mustJSON(final))
 	return nil
 }
 
-type orderRow struct {
-	ID               string
-	OrderNumber      string
-	OrderStatus      string
-	ShippingStatus   string
-	ProductionStatus string
-	TrackingNumber   *string
-	CustomerID       string
-}
-
-type prodRow struct {
-	Stage         string
-	DelayReported bool
-	DelayReason   string
-}
-
-type shipRow struct {
-	Status         string
-	TrackingNumber string
-}
-
-type custRow struct {
-	ID               string
-	Name             string
-	Email            string
-	RecentOrderCount int
-}
-
-func (r *Runner) getOrder(ctx context.Context, orderNumber string) (orderRow, error) {
-	var o orderRow
-	err := r.Pool.QueryRow(ctx, `
-		select id, "orderNumber", "orderStatus", "shippingStatus", "productionStatus", "trackingNumber", "customerId"
-		from "Order" where "orderNumber" = $1 or id = $1 limit 1`, orderNumber).
-		Scan(&o.ID, &o.OrderNumber, &o.OrderStatus, &o.ShippingStatus, &o.ProductionStatus, &o.TrackingNumber, &o.CustomerID)
-	if err != nil {
-		return o, fmt.Errorf("get order: %w", err)
+func summarizeToolResult(name string, result toolResult) string {
+	if !result.OK {
+		return result.Error
 	}
-	return o, nil
+	data, _ := result.Data.(map[string]any)
+	switch name {
+	case "get_order_details":
+		if order, ok := data["order"].(map[string]any); ok {
+			return fmt.Sprintf("Found order %v. Status: %v; shipping: %v.",
+				order["orderNumber"], order["orderStatus"], order["shippingStatus"])
+		}
+	case "get_production_status":
+		if delay, _ := data["delayReported"].(bool); delay {
+			return fmt.Sprintf("Production delayed — %v. Stage: %v.", data["delayReason"], data["currentStage"])
+		}
+		return fmt.Sprintf("Production stage: %v.", data["currentStage"])
+	case "track_shipment":
+		if data["trackingNumber"] == nil || data["trackingNumber"] == "" {
+			return "No tracking number on this order yet."
+		}
+		return fmt.Sprintf("Shipment status: %v.", data["shipmentStatus"])
+	case "get_customer_history":
+		return fmt.Sprintf("Customer %v reviewed.", data["name"])
+	case "send_customer_email":
+		return "Status email stored as simulated send."
+	case "create_support_ticket":
+		return fmt.Sprintf("Opened internal ticket (%v).", data["category"])
+	case "request_human_approval":
+		return "Paused for human approval."
+	case "record_agent_outcome":
+		return fmt.Sprintf("Recorded outcome: %v.", data["finalStatus"])
+	}
+	return "Tool succeeded"
 }
 
-func (r *Runner) getProduction(ctx context.Context, orderID string) (prodRow, error) {
-	var p prodRow
-	err := r.Pool.QueryRow(ctx, `
-		select coalesce(stage, ''), coalesce("delayReported", false), coalesce("delayReason", '')
-		from "ProductionRecord"
-		where "orderId" = $1
-		order by "updatedAt" desc
-		limit 1`, orderID).Scan(&p.Stage, &p.DelayReported, &p.DelayReason)
-	if err != nil {
-		// Fall back to order production status
-		var status string
-		_ = r.Pool.QueryRow(ctx, `select "productionStatus" from "Order" where id = $1`, orderID).Scan(&status)
-		p.Stage = status
-		p.DelayReported = strings.Contains(strings.ToLower(status), "delay")
+func mapExecStatus(taskStatus string) string {
+	switch taskStatus {
+	case "awaiting_approval":
+		return "awaiting_approval"
+	case "failed":
+		return "failed"
+	case "escalated", "needs_human":
+		return "completed"
+	default:
+		return "completed"
 	}
-	return p, nil
 }
 
-func (r *Runner) getShipment(ctx context.Context, orderID string, tracking *string) (shipRow, error) {
-	var s shipRow
-	if tracking != nil {
-		s.TrackingNumber = *tracking
+func tryParseFinal(content string) map[string]any {
+	if content == "" {
+		return nil
 	}
-	err := r.Pool.QueryRow(ctx, `
-		select coalesce(status, ''), coalesce("trackingNumber", '')
-		from "ShipmentEvent"
-		where "orderId" = $1
-		order by "eventAt" desc
-		limit 1`, orderID).Scan(&s.Status, &s.TrackingNumber)
-	if err != nil {
-		var shipStatus string
-		_ = r.Pool.QueryRow(ctx, `select "shippingStatus" from "Order" where id = $1`, orderID).Scan(&shipStatus)
-		s.Status = shipStatus
+	s := strings.TrimSpace(content)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil
 	}
-	return s, nil
+	var out map[string]any
+	if err := json.Unmarshal([]byte(s[start:end+1]), &out); err != nil {
+		return nil
+	}
+	return out
 }
 
-func (r *Runner) getCustomer(ctx context.Context, customerID string) (custRow, error) {
-	var c custRow
-	err := r.Pool.QueryRow(ctx, `
-		select c.id, c.name, c.email,
-		       (select count(*) from "Order" o where o."customerId" = c.id)
-		from "Customer" c
-		where c.id = $1 or c."externalId" = $1
-		limit 1`, customerID).Scan(&c.ID, &c.Name, &c.Email, &c.RecentOrderCount)
-	if err != nil {
-		return c, fmt.Errorf("get customer: %w", err)
+func synthesizeFinal(tools []string, paused bool) map[string]any {
+	status := "resolved"
+	if paused {
+		status = "awaiting_approval"
 	}
-	return c, nil
+	return map[string]any{
+		"problemIdentified":         "Order operations investigation",
+		"evidenceCollected":         tools,
+		"investigationSummary":      "OpenAI completed a tool-using investigation using verified Supabase evidence.",
+		"rootCause":                 nil,
+		"proposedOrCompletedAction": "Investigation completed via OpenAI + Go Supabase tools",
+		"approvalRequired":          paused,
+		"customerResponse":          nil,
+		"remainingRisks":            []string{},
+		"finalTaskStatus":           status,
+	}
+}
+
+func estimateCost(model string, prompt, completion int) float64 {
+	rates := map[string][2]float64{
+		"gpt-5-mini":  {0.25, 2.0},
+		"gpt-5-nano":  {0.05, 0.4},
+		"gpt-4o-mini": {0.15, 0.6},
+	}
+	r, ok := rates[model]
+	if !ok {
+		r = rates["gpt-5-mini"]
+	}
+	return (float64(prompt)*r[0] + float64(completion)*r[1]) / 1_000_000
 }
 
 func (r *Runner) addStep(ctx context.Context, st *runState, stepType, title, detail, toolName, resultJSON string) error {
+	return r.addStepFull(ctx, st, stepType, title, detail, toolName, resultJSON, "completed")
+}
+
+func (r *Runner) addStepFull(ctx context.Context, st *runState, stepType, title, detail, toolName, resultJSON, status string) error {
 	st.stepIndex++
 	id := newID()
 	_, err := r.Pool.Exec(ctx, `
 		insert into "AgentStep"
 			(id, "executionId", "stepIndex", "stepType", title, detail, "toolName", "toolResultJson", status, "createdAt")
-		values ($1,$2,$3,$4,$5,$6,nullif($7,''),nullif($8,''),'completed',now())`,
-		id, st.execID, st.stepIndex, stepType, title, detail, toolName, resultJSON)
-	return err
+		values ($1,$2,$3,$4,$5,$6,nullif($7,''),nullif($8,''),$9,now())`,
+		id, st.execID, st.stepIndex, stepType, title, detail, toolName, resultJSON, status)
+	if err != nil {
+		return err
+	}
+	notify.StepAdded(st.taskID, st.execID, map[string]any{
+		"id":             id,
+		"stepIndex":      st.stepIndex,
+		"stepType":       stepType,
+		"title":          title,
+		"detail":         detail,
+		"toolName":       nullIfEmpty(toolName),
+		"toolResultJson": nullIfEmpty(resultJSON),
+		"status":         status,
+		"createdAt":      time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	return nil
+}
+
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
 }
 
 func (r *Runner) finishExecution(ctx context.Context, st *runState, status string) error {
@@ -363,6 +484,7 @@ func (r *Runner) failTask(ctx context.Context, st *runState, reason string) erro
 		set status = 'failed', "errorMessage" = $2, "completedAt" = now()
 		where id = $1`, st.execID, truncate(reason, 2000))
 	_ = r.addStep(ctx, st, "error", "Agent error", reason, "", "")
+	notify.TaskUpdated(st.taskID, st.taskNumber, "failed")
 	return fmt.Errorf("%s", reason)
 }
 
@@ -389,22 +511,11 @@ func coalesce(a, b string) string {
 	return b
 }
 
-func pickProblem(prod prodRow, order orderRow) string {
-	if prod.DelayReported {
-		return "Production delay"
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
 	}
-	if order.TrackingNumber == nil || *order.TrackingNumber == "" {
-		return "Missing tracking"
-	}
-	return "Order operations investigation"
-}
-
-func buildEmail(name, orderNumber string, findings []string) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Hi %s,\n\nThank you for checking in on order %s.\n\nHere is what we can confirm right now:\n", name, orderNumber))
-	for _, f := range findings {
-		b.WriteString("• " + f + "\n")
-	}
-	b.WriteString("\nWe are continuing to monitor this and will follow up if anything meaningful changes.\n\nThank you for your patience,\nCommerceOps Support\n")
-	return b.String()
+	return ""
 }
