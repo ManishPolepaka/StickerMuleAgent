@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { agentDebug, agentDebugWarn } from "@/lib/client/agent-debug";
 
 type OrderOption = { orderNumber: string; issueType: string | null };
 
@@ -50,6 +51,7 @@ export function RunInvestigationButton({
       return;
     }
     setLoading(true);
+    agentDebug("run", "POST /api/tasks starting", { orderId: orderId || null, prompt });
     try {
       const res = await fetch("/api/tasks", {
         method: "POST",
@@ -57,11 +59,13 @@ export function RunInvestigationButton({
         body: JSON.stringify({ orderId: orderId || null, prompt }),
       });
       const data = await res.json();
+      agentDebug("run", `response ${res.status}`, data);
       if (!res.ok) throw new Error(data.error || "Failed to start");
       toast.success("Investigation started");
       setOpen(false);
       router.push(`/tasks/${data.task.id}`);
     } catch (err) {
+      agentDebugWarn("run", "start failed", err);
       toast.error(err instanceof Error ? err.message : "Failed to start investigation");
     } finally {
       setLoading(false);

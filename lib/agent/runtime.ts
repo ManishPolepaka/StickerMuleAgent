@@ -17,17 +17,21 @@ import { cacheInvalidate } from "@/lib/cache/memory";
 function runInBackground(work: () => void | Promise<void>) {
   const run = async () => {
     try {
+      console.log("[agent] background loop starting");
       await work();
+      console.log("[agent] background loop finished");
     } catch (err) {
-      console.error("Background agent start failed:", err);
+      console.error("[agent] Background agent start failed:", err);
       throw err;
     }
   };
 
   try {
     after(run);
+    console.log("[agent] scheduled via next/server after()");
   } catch {
     // Outside a request context (scripts/tests): fire-and-forget.
+    console.log("[agent] after() unavailable — using setTimeout fallback");
     setTimeout(() => {
       void run();
     }, 0);
@@ -51,8 +55,9 @@ Your job:
    - Refunds, credits, discounts, cancellations, shipping-address changes, compensation promises
 6. For normal delivery/status inquiries: investigate → send_customer_email with a verified update → record_agent_outcome with finalTaskStatus "resolved" and approvalRequired false.
 7. Customer copy rules: write findings and emails in plain language. Never put snake_case codes (not_shipped, in_production) or ISO timestamps (2026-10-04T09:03:39.144Z) in customer emails — say "has not shipped yet" and "October 4, 2026" instead.
-8. Prefer verified tool results. Always call record_agent_outcome before finishing.
-9. CRITICAL: Your FINAL assistant message (after tools) must be ONLY a single raw JSON object — no markdown, no headings, no bullet lists, no code fences. Exact shape:
+8. SPEED: When tools are independent, call several in ONE turn (e.g. get_production_status + track_shipment together). Prefer the shortest path: investigate → send_customer_email → record_agent_outcome.
+9. Prefer verified tool results. Always call record_agent_outcome before finishing.
+10. CRITICAL: Your FINAL assistant message (after tools) must be ONLY a single raw JSON object — no markdown, no headings, no bullet lists, no code fences. Exact shape:
 {
   "problemIdentified": string,
   "evidenceCollected": string[],
@@ -440,7 +445,10 @@ export async function runAgentLoop(taskId: string) {
       status,
       taskNumber: task.taskNumber,
     });
-    publishRealtime({ type: "dashboard_changed", reason: `task_${status}` });
+    // Avoid dashboard SSE storms during the loop; only notify on terminal-ish updates.
+    if (status !== "running") {
+      publishRealtime({ type: "dashboard_changed", reason: `task_${status}` });
+    }
   };
 
   await addStep({
@@ -473,16 +481,21 @@ export async function runAgentLoop(taskId: string) {
   const toolResultSnippets: string[] = [];
 
   try {
+    console.log(`[agent] loop start task=${task.taskNumber} provider=${provider.id} model=${modelName}`);
     for (let i = 0; i < maxIterations; i++) {
       if (Date.now() - started > timeoutMs) {
         throw new Error("Agent execution timed out.");
       }
 
+      console.log(`[agent] iteration ${i + 1}/${maxIterations}`);
       const response = await provider.complete({
         model: modelName,
         messages,
         tools: getToolDefinitions(),
       });
+      console.log(
+        `[agent] model response finish=${response.finishReason} tools=${response.toolCalls?.length || 0}`,
+      );
 
       if (response.usage) {
         promptTokens += response.usage.promptTokens;
@@ -497,8 +510,10 @@ export async function runAgentLoop(taskId: string) {
           toolCalls: response.toolCalls,
         });
 
+        // Log call steps, then execute independent tools in parallel (faster).
         for (const call of response.toolCalls) {
           usedToolNames.push(call.name);
+          console.log(`[agent] tool ${call.name}`);
           await addStep({
             stepType: "tool_call",
             title: titleForTool(call.name),
@@ -506,13 +521,21 @@ export async function runAgentLoop(taskId: string) {
             toolInputJson: JSON.stringify(call.arguments),
             detail: `Calling ${call.name}`,
           });
+        }
 
-          const result = await executeTool(call.name, call.arguments, {
-            taskId: task.id,
-            executionId: execution.id,
-            actorRole: "agent",
-          });
+        const settled = await Promise.all(
+          response.toolCalls.map(async (call) => {
+            const result = await executeTool(call.name, call.arguments, {
+              taskId: task.id,
+              executionId: execution.id,
+              actorRole: "agent",
+            });
+            console.log(`[agent] tool ${call.name} -> ${result.ok ? "ok" : "error"}`);
+            return { call, result };
+          }),
+        );
 
+        for (const { call, result } of settled) {
           toolResultSnippets.push(JSON.stringify(result).slice(0, 500));
 
           await addStep({

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { agentDebug, agentDebugWarn } from "@/lib/client/agent-debug";
 
 type Handler = (data: Record<string, unknown>) => void;
 
@@ -18,6 +19,8 @@ export function useEventSource(url: string | null, onEvent: Handler, enabled = t
   useEffect(() => {
     if (!url || !enabled) return;
 
+    agentDebug("sse", `connecting ${url}`);
+
     const flush = () => {
       const batch = queueRef.current;
       queueRef.current = [];
@@ -27,9 +30,16 @@ export function useEventSource(url: string | null, onEvent: Handler, enabled = t
     };
 
     const es = new EventSource(url);
+    es.onopen = () => {
+      agentDebug("sse", `open ${url}`);
+    };
+    es.onerror = () => {
+      agentDebugWarn("sse", `error/retry ${url}`, { readyState: es.readyState });
+    };
     es.onmessage = (msg) => {
       try {
         const data = JSON.parse(msg.data) as Record<string, unknown>;
+        agentDebug("sse", `event ${String(data.type || "?")}`, data);
         if (data.type === "connected") {
           handlerRef.current(data);
           return;
@@ -38,11 +48,12 @@ export function useEventSource(url: string | null, onEvent: Handler, enabled = t
         if (timerRef.current) clearTimeout(timerRef.current);
         timerRef.current = setTimeout(flush, 150);
       } catch {
-        // ignore malformed frames
+        agentDebugWarn("sse", "malformed frame", msg.data);
       }
     };
 
     return () => {
+      agentDebug("sse", `closing ${url}`);
       if (timerRef.current) clearTimeout(timerRef.current);
       flush();
       es.close();

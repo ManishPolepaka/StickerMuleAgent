@@ -141,49 +141,45 @@ export function createSimulatedProvider(): ModelProvider {
       }
 
       const orderJson = results[0] || "{}";
-      let orderData: { customerId?: string; trackingNumber?: string | null; order?: { customerId?: string; trackingNumber?: string | null } } = {};
+      let orderData: {
+        customerId?: string;
+        trackingNumber?: string | null;
+        order?: { customerId?: string; trackingNumber?: string | null };
+        customer?: { id?: string };
+      } = {};
       try {
         orderData = JSON.parse(orderJson);
       } catch {
         orderData = {};
       }
-      const customerId =
-        (orderData as { customer?: { id?: string }; customerId?: string }).customer?.id ||
-        (orderData as { customerId?: string }).customerId;
+      const customerId = orderData.customer?.id || orderData.customerId;
       const tracking =
-        (orderData as { order?: { trackingNumber?: string } }).order?.trackingNumber ||
-        (orderData as { trackingNumber?: string }).trackingNumber;
+        orderData.order?.trackingNumber || orderData.trackingNumber;
 
-      if (!used.has("get_production_status")) {
-        return {
-          content: "Checking production status.",
-          toolCalls: [makeCall("get_production_status", { orderId })],
-          finishReason: "tool_calls",
-          usage: { promptTokens: 130, completionTokens: 30, totalTokens: 160 },
-          estimatedCostUsd: 0,
-        };
-      }
-
-      if (!used.has("track_shipment")) {
-        return {
-          content: "Checking shipment tracking.",
-          toolCalls: [
+      // Batch read tools in one turn (runtime runs them in parallel).
+      if (!used.has("get_production_status") || !used.has("track_shipment")) {
+        const batch = [];
+        if (!used.has("get_production_status")) {
+          batch.push(makeCall("get_production_status", { orderId }));
+        }
+        if (!used.has("track_shipment")) {
+          batch.push(
             makeCall("track_shipment", tracking ? { trackingNumber: tracking } : { orderId }),
-          ],
-          finishReason: "tool_calls",
-          usage: { promptTokens: 140, completionTokens: 30, totalTokens: 170 },
-          estimatedCostUsd: 0,
-        };
-      }
-
-      if (customerId && !used.has("get_customer_history")) {
-        return {
-          content: "Reviewing customer history.",
-          toolCalls: [makeCall("get_customer_history", { customerId })],
-          finishReason: "tool_calls",
-          usage: { promptTokens: 150, completionTokens: 30, totalTokens: 180 },
-          estimatedCostUsd: 0,
-        };
+          );
+        }
+        // Customer history only when refund/cancel/address — saves a round on status demos.
+        if ((wantsRefund || wantsCancel || wantsAddress) && customerId && !used.has("get_customer_history")) {
+          batch.push(makeCall("get_customer_history", { customerId }));
+        }
+        if (batch.length) {
+          return {
+            content: "Checking production and shipping in parallel.",
+            toolCalls: batch,
+            finishReason: "tool_calls",
+            usage: { promptTokens: 140, completionTokens: 40, totalTokens: 180 },
+            estimatedCostUsd: 0,
+          };
+        }
       }
 
       if (wantsRefund || wantsCancel || wantsAddress) {
@@ -268,10 +264,14 @@ export function createSimulatedProvider(): ModelProvider {
         };
       }
 
-      if ((missingTracking || productionDelay || staleTracking) && !used.has("create_support_ticket")) {
-        return {
-          content: "Creating internal support ticket.",
-          toolCalls: [
+      // Ticket + draft in one turn (faster demo; ticket is optional internal record).
+      if (
+        (missingTracking || productionDelay || staleTracking) &&
+        (!used.has("create_support_ticket") || !used.has("draft_customer_email"))
+      ) {
+        const batch = [];
+        if (!used.has("create_support_ticket")) {
+          batch.push(
             makeCall("create_support_ticket", {
               orderId,
               issueCategory: productionDelay
@@ -282,17 +282,10 @@ export function createSimulatedProvider(): ModelProvider {
               description: `Automated investigation finding for ${orderId}`,
               priority: "medium",
             }),
-          ],
-          finishReason: "tool_calls",
-          usage: { promptTokens: 180, completionTokens: 40, totalTokens: 220 },
-          estimatedCostUsd: 0,
-        };
-      }
-
-      if (!used.has("draft_customer_email")) {
-        return {
-          content: "Drafting customer email from verified findings only.",
-          toolCalls: [
+          );
+        }
+        if (!used.has("draft_customer_email")) {
+          batch.push(
             makeCall("draft_customer_email", {
               orderId,
               verifiedFindings: productionDelay
@@ -316,43 +309,28 @@ export function createSimulatedProvider(): ModelProvider {
               intendedCommunication:
                 "We are continuing to monitor this and will follow up if anything meaningful changes.",
             }),
-          ],
-          finishReason: "tool_calls",
-          usage: { promptTokens: 200, completionTokens: 40, totalTokens: 240 },
-          estimatedCostUsd: 0,
-        };
+          );
+        }
+        if (batch.length) {
+          return {
+            content: "Creating ticket and drafting customer update.",
+            toolCalls: batch,
+            finishReason: "tool_calls",
+            usage: { promptTokens: 200, completionTokens: 40, totalTokens: 240 },
+            estimatedCostUsd: 0,
+          };
+        }
       }
 
-      // Status updates: send the drafted email directly (no human approval).
-      if (!deliveredDispute && !used.has("send_customer_email")) {
-        let to = "customer@example.com";
-        let subject = `Update on your order ${orderId}`;
-        let message =
-          "We reviewed your order and wanted to share a verified status update. Thank you for your patience.";
-        for (const r of results) {
-          try {
-            const parsed = JSON.parse(r) as {
-              ok?: boolean;
-              data?: { to?: string; subject?: string; body?: string };
-            };
-            if (parsed?.ok && parsed.data?.body) {
-              to = parsed.data.to || to;
-              subject = parsed.data.subject || subject;
-              message = parsed.data.body;
-              break;
-            }
-          } catch {
-            // ignore non-JSON tool payloads
-          }
-        }
+      if (!used.has("draft_customer_email")) {
         return {
-          content: "Sending simulated status email to the customer.",
+          content: "Drafting customer email from verified findings only.",
           toolCalls: [
-            makeCall("send_customer_email", {
-              customerEmail: to,
-              subject,
-              message,
-              relatedOrderId: orderId,
+            makeCall("draft_customer_email", {
+              orderId,
+              verifiedFindings: ["We reviewed your order using our available order and shipping records"],
+              intendedCommunication:
+                "We are continuing to monitor this and will follow up if anything meaningful changes.",
             }),
           ],
           finishReason: "tool_calls",
@@ -361,29 +339,75 @@ export function createSimulatedProvider(): ModelProvider {
         };
       }
 
-      if (!used.has("record_agent_outcome")) {
-        const status = deliveredDispute
-          ? "escalated"
-          : staleTracking
-            ? "resolved"
-            : productionDelay
-              ? "resolved"
-              : "resolved";
-        return {
-          content: "Recording final outcome.",
-          toolCalls: [
+      // Send + record in one turn when resolving.
+      if (!deliveredDispute && (!used.has("send_customer_email") || !used.has("record_agent_outcome"))) {
+        const batch = [];
+        if (!used.has("send_customer_email")) {
+          let to = "customer@example.com";
+          let subject = `Update on your order ${orderId}`;
+          let message =
+            "We reviewed your order and wanted to share a verified status update. Thank you for your patience.";
+          for (const r of results) {
+            try {
+              const parsed = JSON.parse(r) as {
+                ok?: boolean;
+                data?: { to?: string; subject?: string; body?: string };
+              };
+              if (parsed?.ok && parsed.data?.body) {
+                to = parsed.data.to || to;
+                subject = parsed.data.subject || subject;
+                message = parsed.data.body;
+                break;
+              }
+            } catch {
+              // ignore
+            }
+          }
+          batch.push(
+            makeCall("send_customer_email", {
+              customerEmail: to,
+              subject,
+              message,
+              relatedOrderId: orderId,
+            }),
+          );
+        }
+        if (!used.has("record_agent_outcome")) {
+          batch.push(
             makeCall("record_agent_outcome", {
               taskId: "CURRENT",
-              finalStatus: status,
+              finalStatus: productionDelay || staleTracking ? "resolved" : "resolved",
               actionsTaken: Array.from(used),
               evidence: results.slice(0, 4).map((r) => r.slice(0, 200)),
               summary: productionDelay
                 ? "Identified production delay and sent simulated customer status email."
                 : staleTracking
                   ? "Tracking is stale but package not confirmed lost; sent careful status email."
-                  : deliveredDispute
-                    ? "Delivery dispute escalated due to insufficient evidence."
-                    : "Investigation completed and customer notified with simulated status email.",
+                  : "Investigation completed and customer notified with simulated status email.",
+            }),
+          );
+        }
+        if (batch.length) {
+          return {
+            content: "Sending status email and recording outcome.",
+            toolCalls: batch,
+            finishReason: "tool_calls",
+            usage: { promptTokens: 210, completionTokens: 50, totalTokens: 260 },
+            estimatedCostUsd: 0,
+          };
+        }
+      }
+
+      if (deliveredDispute && !used.has("record_agent_outcome")) {
+        return {
+          content: "Recording final outcome.",
+          toolCalls: [
+            makeCall("record_agent_outcome", {
+              taskId: "CURRENT",
+              finalStatus: "escalated",
+              actionsTaken: Array.from(used),
+              evidence: results.slice(0, 4).map((r) => r.slice(0, 200)),
+              summary: "Delivery dispute escalated due to insufficient evidence.",
             }),
           ],
           finishReason: "tool_calls",

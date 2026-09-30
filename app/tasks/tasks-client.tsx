@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useState, useEffect } from "react";
 import Link from "next/link";
 import { AppShell } from "@/components/layout/app-shell";
 import { RunInvestigationButton } from "@/components/run-investigation-button";
@@ -18,6 +18,7 @@ import {
 import { useEventSource } from "@/hooks/use-event-source";
 import { useCachedJson } from "@/hooks/use-cached-json";
 import { clientCacheInvalidate, clientCachePeek } from "@/lib/client/fetch-cache";
+import { agentDebug } from "@/lib/client/agent-debug";
 import type { TaskListItem } from "@/lib/services/tasks";
 import { formatDateTime } from "@/lib/utils";
 
@@ -59,9 +60,15 @@ export function TasksClient({ initialTasks }: { initialTasks?: TaskListItem[] } 
   useEventSource("/api/realtime/stream", (event) => {
     if (event.type === "connected") {
       setLive("Live");
+      agentDebug("tasks-list", "SSE connected");
       return;
     }
     if (event.type === "task_updated" && event.taskId) {
+      agentDebug("tasks-list", "task_updated", {
+        taskId: event.taskId,
+        taskNumber: event.taskNumber,
+        status: event.status,
+      });
       setLive(`Live · ${new Date().toLocaleTimeString()}`);
       setData((prev) => {
         const list =
@@ -90,10 +97,33 @@ export function TasksClient({ initialTasks }: { initialTasks?: TaskListItem[] } 
       return;
     }
     if (event.type === "trigger_processed" || event.type === "approval_requested" || event.type === "dashboard_changed") {
+      agentDebug("tasks-list", String(event.type), event);
       setLive(`Live · ${new Date().toLocaleTimeString()}`);
       load();
     }
   });
+
+  // Debug-only polling (localStorage.debugAgent=1). Avoids fighting the DB pool in normal runs.
+  const hasRunning = tasks.some((t) => t.status === "running");
+  useEffect(() => {
+    if (!hasRunning) return;
+    try {
+      if (window.localStorage.getItem("debugAgent") !== "1") return;
+    } catch {
+      return;
+    }
+    agentDebug("tasks-list", "polling while tasks are running");
+    const id = window.setInterval(() => {
+      const cached = clientCachePeek<TaskListItem[]>("tasks:list") || [];
+      const running = cached.filter((t) => t.status === "running");
+      agentDebug(
+        "tasks-list",
+        `poll refresh · still running: ${running.map((t) => t.taskNumber).join(", ") || "none"}`,
+      );
+      load();
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [hasRunning, load]);
 
   return (
     <AppShell

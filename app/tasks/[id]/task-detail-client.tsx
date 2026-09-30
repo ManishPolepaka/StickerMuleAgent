@@ -18,6 +18,7 @@ import {
   humanizeSummary,
 } from "@/lib/ui/task-presentation";
 import { clientCacheSet } from "@/lib/client/fetch-cache";
+import { agentDebug, agentDebugWarn } from "@/lib/client/agent-debug";
 import { useClientCacheSnapshot } from "@/hooks/use-cached-json";
 import { TableSkeleton } from "@/components/ui/table-skeleton";
 
@@ -119,17 +120,25 @@ export function TaskDetailClient({
 
   useEffect(() => {
     let alive = true;
+    agentDebug("task-detail", `loading ${taskId}`);
     fetch(`/api/tasks/${taskId}`)
       .then(async (r) => {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || "Failed to load task");
         if (!alive) return;
+        agentDebug("task-detail", "loaded", {
+          taskNumber: d.task?.taskNumber,
+          status: d.task?.status,
+          steps: d.task?.executions?.[0]?.steps?.length ?? 0,
+          execStatus: d.task?.executions?.[0]?.status,
+        });
         clientCacheSet(cacheKey, d.task);
         setTask(d.task);
         setLoadError(null);
       })
       .catch((e) => {
         if (!alive) return;
+        agentDebugWarn("task-detail", "load failed", e);
         setLoadError(e instanceof Error ? e.message : "Failed to load task");
       });
     return () => {
@@ -140,6 +149,12 @@ export function TaskDetailClient({
   useEventSource(`/api/realtime/tasks/${taskId}`, (event) => {
     if (event.type === "step_added" && event.step) {
       const step = event.step as Step;
+      agentDebug("task-detail", "step_added", {
+        title: step.title,
+        toolName: step.toolName,
+        status: step.status,
+        stepIndex: step.stepIndex,
+      });
       setTask((prev) => {
         if (!prev) return prev;
         const executions = [...prev.executions];
@@ -167,16 +182,64 @@ export function TaskDetailClient({
       });
     }
     if (event.type === "task_updated" || event.type === "approval_requested") {
+      agentDebug("task-detail", String(event.type), event);
       fetch(`/api/tasks/${taskId}`)
         .then((r) => r.json())
         .then((data) => {
           if (data.task) {
+            agentDebug("task-detail", "refreshed after event", {
+              status: data.task.status,
+              steps: data.task.executions?.[0]?.steps?.length ?? 0,
+            });
             setTask(data.task);
             clientCacheSet(cacheKey, data.task);
           }
         });
     }
   });
+
+  // Debug-only poll while Running (enable with localStorage.debugAgent='1').
+  useEffect(() => {
+    if (task?.status !== "running") return;
+    try {
+      if (window.localStorage.getItem("debugAgent") !== "1") return;
+    } catch {
+      return;
+    }
+    agentDebug("task-detail", "start running poll", {
+      taskNumber: task.taskNumber,
+      steps: task.executions?.[0]?.steps?.length ?? 0,
+    });
+    const startedAt = Date.now();
+    const id = window.setInterval(() => {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      fetch(`/api/tasks/${taskId}`)
+        .then((r) => r.json())
+        .then((data) => {
+          if (!data.task) return;
+          const stepsCount = data.task.executions?.[0]?.steps?.length ?? 0;
+          const lastStep = data.task.executions?.[0]?.steps?.[stepsCount - 1];
+          agentDebug("task-detail", `poll ${elapsedSec}s`, {
+            status: data.task.status,
+            execStatus: data.task.executions?.[0]?.status,
+            steps: stepsCount,
+            lastStep: lastStep
+              ? `${lastStep.stepType}:${lastStep.toolName || lastStep.title}`
+              : null,
+          });
+          if (data.task.status === "running" && stepsCount === 0 && elapsedSec >= 15) {
+            agentDebugWarn(
+              "task-detail",
+              "still running with 0 steps after 15s — agent loop may be hung (DB pool / after() / model)",
+            );
+          }
+          setTask(data.task);
+          clientCacheSet(cacheKey, data.task);
+        })
+        .catch((err) => agentDebugWarn("task-detail", "poll failed", err));
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [task?.status, task?.taskNumber, taskId, cacheKey]);
 
   // Keep session cache in sync after local task state settles (never inside setState).
   useEffect(() => {
