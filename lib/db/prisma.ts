@@ -4,8 +4,8 @@ const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefi
 
 /**
  * Shared Prisma client.
- * On Netlify/serverless, set DATABASE_URL to Supabase transaction pooler (:6543)
- * with `?pgbouncer=true&connection_limit=1` so each function does not open a pool.
+ * Local/dev: use pooler :6543 with connection_limit=5 so agent + SSE + APIs can run together.
+ * Netlify serverless: set connection_limit=1 in the Netlify DATABASE_URL env var.
  */
 export const prisma =
   globalForPrisma.prisma ??
