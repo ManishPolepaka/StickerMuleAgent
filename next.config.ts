@@ -10,6 +10,13 @@ const nextConfig: NextConfig = {
       static: 600,
     },
   },
+  // Ensure Prisma query engine binaries are available in Netlify serverless functions
+  outputFileTracingIncludes: {
+    "/*": [
+      "./node_modules/.prisma/client/**",
+      "./node_modules/@prisma/client/**",
+    ],
+  },
 };
 
 export default nextConfig;

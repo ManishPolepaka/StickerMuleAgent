@@ -3,9 +3,9 @@ import { PrismaClient } from "@prisma/client";
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
 /**
- * Shared Prisma client for Supabase transaction pooler (:6543 + pgbouncer=true).
- * Use a small pool (2–3): connection_limit=1 starves the agent loop when the UI
- * (SSE + list APIs) also needs a connection; large pools cause remote resets.
+ * Shared Prisma client.
+ * On Netlify/serverless, set DATABASE_URL to Supabase transaction pooler (:6543)
+ * with `?pgbouncer=true&connection_limit=1` so each function does not open a pool.
  */
 export const prisma =
   globalForPrisma.prisma ??

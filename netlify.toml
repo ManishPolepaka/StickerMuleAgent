@@ -9,4 +9,6 @@
   SECRETS_SCAN_OMIT_KEYS = "OPENAI_MODEL,DEMO_ADMIN_ROLE,NEXT_PUBLIC_APP_NAME"
 
 # Set real secrets in the Netlify UI (not in git):
-# DATABASE_URL, DIRECT_URL, OPENAI_API_KEY (optional), OPENAI_MODEL, DEMO_ADMIN_ROLE
+# DATABASE_URL  → Supabase *Transaction pooler* :6543 with ?pgbouncer=true&connection_limit=1
+# DIRECT_URL    → pooler :5432 or direct db host
+# OPENAI_API_KEY (optional), OPENAI_MODEL, DEMO_ADMIN_ROLE
