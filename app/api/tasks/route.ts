@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { startInvestigation } from "@/lib/agent/runtime";
+import { reclaimStuckRunningTasks } from "@/lib/agent/reclaim";
 import { jsonError, jsonOk, parseJson } from "@/lib/api";
 import { cacheInvalidate } from "@/lib/cache/memory";
 import { getTasksList, warmTasksList } from "@/lib/services/tasks";
@@ -14,7 +15,10 @@ const createSchema = z.object({
 
 export async function GET() {
   try {
-    // Force a fresh DB read so newly started agents appear immediately.
+    // Safety net: never show zombie Running tasks in the UI.
+    await reclaimStuckRunningTasks().catch((err) =>
+      console.warn("[agent] reclaim on list failed:", err),
+    );
     cacheInvalidate("tasks:");
     await warmTasksList();
     return jsonOk(await getTasksList());

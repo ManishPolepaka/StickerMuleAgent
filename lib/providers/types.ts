@@ -59,5 +59,7 @@ export type ModelProvider = {
     messages: ProviderMessage[];
     tools: ToolDefinition[];
     temperature?: number;
+    signal?: AbortSignal;
+    timeoutMs?: number;
   }): Promise<ProviderResponse>;
 };

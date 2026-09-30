@@ -25,7 +25,10 @@ function isTransientDbError(err: unknown): boolean {
     msg.includes("Can't reach database server") ||
     msg.includes("P1001") ||
     msg.includes("P1017") ||
-    msg.includes("10054")
+    msg.includes("10054") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("connection pool")
   );
 }
 

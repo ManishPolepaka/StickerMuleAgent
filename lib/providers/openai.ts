@@ -43,27 +43,43 @@ export function createOpenAIProvider(): ModelProvider {
     id: "openai",
     displayName: "OpenAI",
     isSimulated: false,
-    async complete({ model, messages, tools, temperature = 0.2 }): Promise<ProviderResponse> {
+    async complete({
+      model,
+      messages,
+      tools,
+      temperature = 0.2,
+      signal,
+      timeoutMs = 45_000,
+    }): Promise<ProviderResponse> {
       const apiKey = process.env.OPENAI_API_KEY;
       if (!apiKey) {
         throw new Error("OPENAI_API_KEY is not configured.");
       }
 
-      const client = new OpenAI({ apiKey });
-      const response = await client.chat.completions.create({
-        model,
-        ...(supportsTemperature(model) ? { temperature } : {}),
-        messages: toOpenAIMessages(messages),
-        tools: tools.map((t) => ({
-          type: "function" as const,
-          function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.parameters,
-          },
-        })),
-        tool_choice: "auto",
+      // Fail fast — never hang for the SDK's default ~10 minutes.
+      const client = new OpenAI({
+        apiKey,
+        timeout: timeoutMs,
+        maxRetries: 0,
       });
+
+      const response = await client.chat.completions.create(
+        {
+          model,
+          ...(supportsTemperature(model) ? { temperature } : {}),
+          messages: toOpenAIMessages(messages),
+          tools: tools.map((t) => ({
+            type: "function" as const,
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            },
+          })),
+          tool_choice: "auto",
+        },
+        { signal, timeout: timeoutMs },
+      );
 
       const choice = response.choices[0];
       const toolCalls =

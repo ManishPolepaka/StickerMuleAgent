@@ -1,28 +1,30 @@
 import { after } from "next/server";
 import { prisma, withPrismaRetry } from "@/lib/db/prisma";
 import { getModelProvider } from "@/lib/providers";
-import type { ProviderMessage } from "@/lib/providers/types";
+import { createSimulatedProvider } from "@/lib/providers/simulated";
+import type { ModelProvider, ProviderMessage } from "@/lib/providers/types";
 import { AgentFinalResultSchema, type AgentFinalResult } from "@/lib/providers/types";
 import { executeTool, getToolDefinitions } from "@/lib/tools";
 import { assertCanRunAgent } from "@/lib/agent/permissions";
 import { ensurePendingApproval } from "@/lib/agent/ensure-approval";
 import { isRestrictedAction } from "@/lib/agent/permissions";
+import { forceFailTask } from "@/lib/agent/reclaim";
 import { publishRealtime } from "@/lib/realtime/events";
 import { cacheInvalidate } from "@/lib/cache/memory";
 
 /**
  * Run work after the HTTP response is sent.
- * Must return a Promise to `after()` so Next keeps the runtime alive until the agent finishes.
+ * Never rethrow after scheduling — terminal status must be written inside the work/finally.
  */
-function runInBackground(work: () => void | Promise<void>) {
+function runInBackground(work: () => Promise<void>) {
   const run = async () => {
     try {
       console.log("[agent] background loop starting");
       await work();
       console.log("[agent] background loop finished");
     } catch (err) {
-      console.error("[agent] Background agent start failed:", err);
-      throw err;
+      console.error("[agent] Background agent failed:", err);
+      // Do not rethrow — Next after() rejection must not erase a partial fail write.
     }
   };
 
@@ -30,7 +32,6 @@ function runInBackground(work: () => void | Promise<void>) {
     after(run);
     console.log("[agent] scheduled via next/server after()");
   } catch {
-    // Outside a request context (scripts/tests): fire-and-forget.
     console.log("[agent] after() unavailable — using setTimeout fallback");
     setTimeout(() => {
       void run();
@@ -345,21 +346,8 @@ export async function startInvestigation(input: StartInvestigationInput) {
     try {
       await runAgentLoop(task.id);
     } catch (err) {
-      await prisma.agentTask.update({
-        where: { id: task.id },
-        data: {
-          status: "failed",
-          actionResult: err instanceof Error ? err.message : String(err),
-          completedAt: new Date(),
-        },
-      });
-      publishRealtime({
-        type: "task_updated",
-        taskId: task.id,
-        status: "failed",
-        taskNumber: task.taskNumber,
-      });
-      publishRealtime({ type: "dashboard_changed", reason: "task_failed" });
+      const message = err instanceof Error ? err.message : String(err);
+      await forceFailTask(task.id, message);
     }
   });
 
@@ -380,22 +368,24 @@ export async function runAgentLoop(taskId: string) {
     executionTimeoutMs: 120000,
   };
 
-  const provider = getModelProvider(settings.provider);
-  const modelName =
+  let provider: ModelProvider = getModelProvider(settings.provider);
+  let modelName =
     provider.isSimulated
       ? "simulated-order-ops-v1"
       : settings.modelName || process.env.OPENAI_MODEL || "gpt-5-mini";
 
-  const execution = await prisma.agentExecution.create({
-    data: {
-      taskId: task.id,
-      agentName: "Order Operations Agent",
-      modelProvider: provider.id,
-      modelName,
-      inputSummary: task.prompt.slice(0, 500),
-      status: "running",
-    },
-  });
+  const execution = await withPrismaRetry(() =>
+    prisma.agentExecution.create({
+      data: {
+        taskId: task.id,
+        agentName: "Order Operations Agent",
+        modelProvider: provider.id,
+        modelName,
+        inputSummary: task.prompt.slice(0, 500),
+        status: "running",
+      },
+    }),
+  );
 
   let stepIndex = 0;
   const addStep = async (data: {
@@ -470,8 +460,13 @@ export async function runAgentLoop(taskId: string) {
   ];
 
   const started = Date.now();
-  const timeoutMs = settings.executionTimeoutMs || 120000;
-  const maxIterations = settings.maxIterations || 12;
+  // Hard wall-clock budget (default 90s) — never leave tasks Running forever.
+  const timeoutMs = Math.min(settings.executionTimeoutMs || 90_000, 120_000);
+  const maxIterations = Math.min(settings.maxIterations || 10, 12);
+  const abort = new AbortController();
+  const deadlineTimer = setTimeout(() => {
+    abort.abort(new Error("Agent execution timed out."));
+  }, timeoutMs);
   let promptTokens = 0;
   let completionTokens = 0;
   let estimatedCost = 0;
@@ -479,20 +474,48 @@ export async function runAgentLoop(taskId: string) {
   let finalResult: AgentFinalResult | null = null;
   const usedToolNames: string[] = [];
   const toolResultSnippets: string[] = [];
+  let openAiFailedOver = false;
 
   try {
-    console.log(`[agent] loop start task=${task.taskNumber} provider=${provider.id} model=${modelName}`);
+    console.log(`[agent] loop start task=${task.taskNumber} provider=${provider.id} model=${modelName} budgetMs=${timeoutMs}`);
     for (let i = 0; i < maxIterations; i++) {
-      if (Date.now() - started > timeoutMs) {
+      if (abort.signal.aborted || Date.now() - started > timeoutMs) {
         throw new Error("Agent execution timed out.");
       }
 
       console.log(`[agent] iteration ${i + 1}/${maxIterations}`);
-      const response = await provider.complete({
-        model: modelName,
-        messages,
-        tools: getToolDefinitions(),
-      });
+      let response;
+      try {
+        response = await provider.complete({
+          model: modelName,
+          messages,
+          tools: getToolDefinitions(),
+          signal: abort.signal,
+          timeoutMs: Math.min(45_000, Math.max(5_000, timeoutMs - (Date.now() - started))),
+        });
+      } catch (modelErr) {
+        // Demo reliability: if OpenAI hangs/fails, finish with simulated provider.
+        if (!provider.isSimulated && !openAiFailedOver) {
+          openAiFailedOver = true;
+          console.warn("[agent] OpenAI failed — falling back to simulated provider", modelErr);
+          provider = createSimulatedProvider();
+          modelName = "simulated-order-ops-v1";
+          await addStep({
+            stepType: "lifecycle",
+            title: "Switched to simulated provider",
+            detail: "OpenAI timed out or failed; continuing with demo provider so the task can finish.",
+          });
+          response = await provider.complete({
+            model: modelName,
+            messages,
+            tools: getToolDefinitions(),
+            signal: abort.signal,
+            timeoutMs: 15_000,
+          });
+        } else {
+          throw modelErr;
+        }
+      }
       console.log(
         `[agent] model response finish=${response.finishReason} tools=${response.toolCalls?.length || 0}`,
       );
@@ -510,8 +533,9 @@ export async function runAgentLoop(taskId: string) {
           toolCalls: response.toolCalls,
         });
 
-        // Log call steps, then execute independent tools in parallel (faster).
+        // Serialize tools to avoid Prisma pool starvation (was Promise.all).
         for (const call of response.toolCalls) {
+          if (abort.signal.aborted) throw new Error("Agent execution timed out.");
           usedToolNames.push(call.name);
           console.log(`[agent] tool ${call.name}`);
           await addStep({
@@ -521,21 +545,14 @@ export async function runAgentLoop(taskId: string) {
             toolInputJson: JSON.stringify(call.arguments),
             detail: `Calling ${call.name}`,
           });
-        }
 
-        const settled = await Promise.all(
-          response.toolCalls.map(async (call) => {
-            const result = await executeTool(call.name, call.arguments, {
-              taskId: task.id,
-              executionId: execution.id,
-              actorRole: "agent",
-            });
-            console.log(`[agent] tool ${call.name} -> ${result.ok ? "ok" : "error"}`);
-            return { call, result };
-          }),
-        );
+          const result = await executeTool(call.name, call.arguments, {
+            taskId: task.id,
+            executionId: execution.id,
+            actorRole: "agent",
+          });
+          console.log(`[agent] tool ${call.name} -> ${result.ok ? "ok" : "error"}`);
 
-        for (const { call, result } of settled) {
           toolResultSnippets.push(JSON.stringify(result).slice(0, 500));
 
           await addStep({
@@ -703,31 +720,58 @@ export async function runAgentLoop(taskId: string) {
     return { executionId: execution.id, result: finalResult };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await addStep({
-      stepType: "error",
-      title: "Agent error",
-      detail: message,
-      status: "error",
-    });
-    await prisma.agentExecution.update({
-      where: { id: execution.id },
-      data: {
-        status: "failed",
-        errorMessage: message,
-        durationMs: Date.now() - started,
-        completedAt: new Date(),
-        promptTokens,
-        completionTokens,
-        totalTokens: promptTokens + completionTokens,
-        estimatedCostUsd: estimatedCost,
-      },
-    });
-    await prisma.agentTask.update({
-      where: { id: task.id },
-      data: { status: "failed", actionResult: message, completedAt: new Date() },
-    });
-    emitTaskStatus("failed");
-    throw err;
+    try {
+      await addStep({
+        stepType: "error",
+        title: "Agent error",
+        detail: message,
+        status: "error",
+      });
+      await withPrismaRetry(() =>
+        prisma.agentExecution.update({
+          where: { id: execution.id },
+          data: {
+            status: "failed",
+            errorMessage: message,
+            durationMs: Date.now() - started,
+            completedAt: new Date(),
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            estimatedCostUsd: estimatedCost,
+          },
+        }),
+      );
+      await withPrismaRetry(() =>
+        prisma.agentTask.update({
+          where: { id: task.id },
+          data: { status: "failed", actionResult: message, completedAt: new Date() },
+        }),
+      );
+      emitTaskStatus("failed");
+    } catch (writeErr) {
+      console.error("[agent] failed to persist error status:", writeErr);
+      await forceFailTask(task.id, message);
+    }
+    // Don't rethrow — background runner must settle cleanly.
+    return { executionId: execution.id, result: null };
+  } finally {
+    clearTimeout(deadlineTimer);
+    // Absolute guarantee: never leave the task Running after the loop ends.
+    try {
+      const still = await prisma.agentTask.findUnique({
+        where: { id: task.id },
+        select: { status: true },
+      });
+      if (still?.status === "running") {
+        await forceFailTask(
+          task.id,
+          "Investigation ended without a terminal status (safety finalize).",
+        );
+      }
+    } catch (finalizeErr) {
+      console.error("[agent] finalize check failed:", finalizeErr);
+    }
   }
 }
 
