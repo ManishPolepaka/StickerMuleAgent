@@ -35,6 +35,7 @@ async function main() {
     agentTickets: tickets.count,
   });
   console.log("Orders/customers/settings kept. Refresh the Tasks page.");
+  console.log("To delete ALL support tickets: npm run db:clear-tickets");
 }
 
 main()

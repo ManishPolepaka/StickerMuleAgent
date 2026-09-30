@@ -245,14 +245,6 @@ export function TriggersClient({
               variant="outline"
               disabled={Boolean(busy)}
               className="w-full justify-start"
-              onClick={() => run({ action: "sla_scan", hours: 4 }, "SLA scan")}
-            >
-              Scan SLA breaches (open tickets &gt; 4h)
-            </Button>
-            <Button
-              variant="outline"
-              disabled={Boolean(busy)}
-              className="w-full justify-start"
               onClick={() => run({ action: "bulk_scan", limit: 5 }, "Bulk scan")}
             >
               Bulk investigate delayed / problem orders

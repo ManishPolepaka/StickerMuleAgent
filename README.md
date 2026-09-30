@@ -12,7 +12,7 @@ This is a **capability sample** — one slice of a larger ops pipeline — not a
 
 Something happens → agent investigates → takes safe actions → asks a human only when needed → leaves a clear audit trail.
 
-- **Multiple ways to start the agent** — not only a manual **Run investigation** click. It can also start from triggers such as a simulated **customer email**, late-order scan, shipping webhook, production delay, SLA breach, or bulk scan (**Triggers & Inbox**).
+- **Multiple ways to start the agent** — not only a manual **Run investigation** click. It can also start from triggers such as a simulated **customer email**, late-order scan, shipping webhook, production delay, or bulk scan (**Triggers & Inbox**).
 - **Status updates:** agent can send a simulated customer email directly (plain language, no technical codes)
 - **Restricted actions:** refunds, credits, cancellations, address changes, and compensation always need human approval
 - **Operators:** live task timeline, approvals, tickets, triggers, and evaluations
@@ -28,7 +28,7 @@ After `npm run dev` and opening the app:
 1. Open **Triggers & Inbox**.
 2. Try one of these (each can start the agent automatically):
    - **Customer message / email** — paste a status question or refund request about an order (e.g. ORD-1000)
-   - **Late order scan** / **Production delay** / **Shipping webhook** / **SLA scan** / **Bulk scan**
+   - **Late order scan** / **Production delay** / **Shipping webhook** / **Bulk scan**
 3. Open **Tasks & Investigations** → click the new task while it is **Running**.
 4. Watch the **timeline** live: each step is a tool call (order lookup, production, shipping, email, etc.).
 5. When it finishes:
@@ -80,7 +80,7 @@ Also useful: **Orders**, **Support Tickets**, **Agent Activity Logs**, **Evaluat
 
 ## Architecture / pipeline
 
-1. Signal comes in from **one of several triggers** (customer email/message, late order, shipping event, production delay, SLA, bulk scan) — or from a manual **Run investigation**
+1. Signal comes in from **one of several triggers** (customer email/message, late order, shipping event, production delay, bulk scan) — or from a manual **Run investigation**
 2. Router decides if an agent should start
 3. Agent investigates using tools only (does not invent facts)
 4. Agent acts: status email / ticket / escalate, or pause for approval on restricted actions
@@ -157,7 +157,6 @@ Open **Triggers & Inbox** (`/triggers`) to simulate:
 | Late order scan | Finds orders past expected delivery |
 | Shipping webhook | Carrier exception → agent (routine updates skipped) |
 | Production delay | Production signal → agent |
-| SLA scan | Open tickets older than N hours |
 | Bulk scan | Operator batch of problem orders |
 
 Live updates use **Server-Sent Events** (`/api/realtime/...`). Timeline and dashboard refresh as the agent writes steps — no polling.

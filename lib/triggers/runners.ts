@@ -377,34 +377,14 @@ export async function ingestProductionDelay(input: {
   });
 }
 
-/** Open support tickets older than N hours */
-export async function runSlaScan(hours = 4) {
-  const cutoff = new Date(Date.now() - hours * 3600000);
-  const tickets = await prisma.supportTicket.findMany({
-    where: {
-      status: "open",
-      createdAt: { lt: cutoff },
-      orderId: { not: null },
-    },
-    include: { order: true },
-    take: 5,
-  });
-
-  const results = [];
-  for (const ticket of tickets) {
-    if (!ticket.order) continue;
-    results.push(
-      await recordAndMaybeStart({
-        triggerType: "sla_breach",
-        source: "scheduler:sla_scan",
-        payload: { ticketId: ticket.id, hoursOpen: hours },
-        orderNumber: ticket.order.orderNumber,
-        hoursOpen: hours,
-        body: ticket.description,
-      }),
-    );
-  }
-  return { scanned: tickets.length, results };
+/** SLA scan disabled for the current demo — it spawned extra tasks from old tickets. */
+export async function runSlaScan(_hours = 4) {
+  return {
+    scanned: 0,
+    results: [],
+    skipped: true,
+    reason: "SLA breach scan is disabled in this demo. Open tickets no longer auto-start agents.",
+  };
 }
 
 /** Operator bulk: investigate all currently delayed/problematic orders */
