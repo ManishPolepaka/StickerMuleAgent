@@ -4,6 +4,9 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  # Model name / demo role are not secrets; omit so the scanner does not fail the deploy
+  # when the same strings appear in source (settings UI, defaults, README).
+  SECRETS_SCAN_OMIT_KEYS = "OPENAI_MODEL,DEMO_ADMIN_ROLE,NEXT_PUBLIC_APP_NAME"
 
-# Next.js runtime is provided by Netlify; keep env vars set in the Netlify UI:
+# Set real secrets in the Netlify UI (not in git):
 # DATABASE_URL, DIRECT_URL, OPENAI_API_KEY (optional), OPENAI_MODEL, DEMO_ADMIN_ROLE
