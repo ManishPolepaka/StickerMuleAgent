@@ -14,6 +14,7 @@
     "db:seed": "tsx scripts/seed-supabase.ts",
     "db:clear-tasks": "tsx scripts/clear-investigations.ts",
     "db:clear-tickets": "tsx scripts/clear-tickets.ts",
+    "worker:go": "cd worker && go run ./cmd/worker",
     "db:reset": "prisma db push --force-reset && tsx scripts/seed-supabase.ts",
     "postinstall": "prisma generate"
   },

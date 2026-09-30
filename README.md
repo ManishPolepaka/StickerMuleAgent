@@ -94,11 +94,23 @@ In a real company, those events would often arrive as **webhooks** from email/he
 ## Tech stack
 
 - TypeScript, Next.js 15 (App Router), React, Tailwind CSS, shadcn/ui
-- Postgres via Prisma (Supabase-ready; local demo may use SQLite depending on setup)
-- OpenAI for the agent, with a Simulated LLM fallback when no API key is set
+- **Go agent worker** (`worker/`) for reliable background investigations
+- Postgres via Prisma / Supabase
+- OpenAI for the Node agent path, with Simulated LLM fallback; Go worker uses a deterministic simulated tool loop
 - Realtime via Server-Sent Events (SSE)
 - Zod validation, Vitest tests
 - Recharts, Lucide
+
+### Go worker
+
+```bash
+cd worker
+go run ./cmd/worker
+# health: http://127.0.0.1:8080/health
+# supabase check: http://127.0.0.1:8080/v1/supabase/validate
+```
+
+Set `AGENT_WORKER_URL=http://127.0.0.1:8080` in `.env` so Next delegates runs to Go.
 
 ---
 

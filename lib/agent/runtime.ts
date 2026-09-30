@@ -341,15 +341,37 @@ export async function startInvestigation(input: StartInvestigationInput) {
   cacheInvalidate("tasks:");
   cacheInvalidate("dashboard:");
 
-  // Detach from the request so /api/triggers returns before the OpenAI loop.
-  runInBackground(async () => {
-    try {
-      await runAgentLoop(task.id);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await forceFailTask(task.id, message);
-    }
-  });
+  // Detach from the request so /api/triggers returns before the agent loop.
+  const workerURL = process.env.AGENT_WORKER_URL?.replace(/\/$/, "");
+  if (workerURL) {
+    runInBackground(async () => {
+      try {
+        const res = await fetch(`${workerURL}/v1/tasks/${task.id}/run`, { method: "POST" });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Go worker rejected run: ${res.status} ${text}`);
+        }
+        console.log(`[agent] delegated to Go worker ${workerURL} task=${task.taskNumber}`);
+      } catch (err) {
+        console.warn("[agent] Go worker unavailable — falling back to Node runtime", err);
+        try {
+          await runAgentLoop(task.id);
+        } catch (loopErr) {
+          const message = loopErr instanceof Error ? loopErr.message : String(loopErr);
+          await forceFailTask(task.id, message);
+        }
+      }
+    });
+  } else {
+    runInBackground(async () => {
+      try {
+        await runAgentLoop(task.id);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await forceFailTask(task.id, message);
+      }
+    });
+  }
 
   return task;
 }
