@@ -1,0 +1,272 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Customer {
+  id              String           @id @default(cuid())
+  externalId      String           @unique
+  name            String
+  email           String           @unique
+  notes           String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  orders          Order[]
+  supportTickets  SupportTicket[]
+  supportHistory  SupportInteraction[]
+}
+
+model Order {
+  id                   String        @id @default(cuid())
+  orderNumber          String        @unique
+  customerId           String
+  customer             Customer      @relation(fields: [customerId], references: [id])
+  orderDate            DateTime
+  expectedDeliveryDate DateTime
+  orderStatus          String
+  productionStatus     String
+  shippingStatus       String
+  trackingNumber       String?
+  shippingCarrier      String?
+  shippingAddress      String
+  orderValue           Float
+  customerNotes        String?
+  issueType            String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  tasks                AgentTask[]
+  supportTickets       SupportTicket[]
+  productionRecords    ProductionRecord[]
+  shipmentEvents       ShipmentEvent[]
+}
+
+model ProductionRecord {
+  id                    String   @id @default(cuid())
+  orderId               String
+  order                 Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  stage                 String
+  startedAt             DateTime?
+  estimatedCompletionAt DateTime?
+  delayReported         Boolean  @default(false)
+  delayReason           String?
+  notes                 String?
+  updatedAt             DateTime @updatedAt
+}
+
+model ShipmentEvent {
+  id             String   @id @default(cuid())
+  orderId        String
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  trackingNumber String?
+  carrier        String?
+  status         String
+  eventLabel     String
+  location       String?
+  eventAt        DateTime
+  estimatedDelivery DateTime?
+  createdAt      DateTime @default(now())
+}
+
+model SupportInteraction {
+  id          String   @id @default(cuid())
+  customerId  String
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  channel     String
+  subject     String
+  summary     String
+  createdAt   DateTime @default(now())
+}
+
+model SupportTicket {
+  id          String   @id @default(cuid())
+  orderId     String?
+  order       Order?   @relation(fields: [orderId], references: [id])
+  customerId  String?
+  customer    Customer? @relation(fields: [customerId], references: [id])
+  category    String
+  description String
+  priority    String
+  status      String   @default("open")
+  createdBy   String   @default("agent")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model AgentTask {
+  id                   String            @id @default(cuid())
+  taskNumber           String            @unique
+  taskType             String
+  issueType            String?
+  orderId              String?
+  order                Order?            @relation(fields: [orderId], references: [id])
+  prompt               String
+  status               String            @default("pending")
+  priority             String            @default("medium")
+  investigationSummary String?
+  reasoningSummary     String?
+  selectedAction       String?
+  actionResult         String?
+  requiresHumanApproval Boolean          @default(false)
+  finalResultJson      String?
+  triggerType          String?
+  triggerEventId       String?
+  createdAt            DateTime          @default(now())
+  startedAt            DateTime?
+  completedAt          DateTime?
+  executions           AgentExecution[]
+  approvals            HumanApproval[]
+  emails               SimulatedEmail[]
+  triggerEvents        TriggerEvent[]
+}
+
+model IncomingMessage {
+  id             String   @id @default(cuid())
+  channel        String
+  fromEmail      String
+  subject        String
+  body           String
+  orderNumber    String?
+  customerId     String?
+  status         String   @default("new")
+  classification String?
+  taskId         String?
+  createdAt      DateTime @default(now())
+}
+
+model TriggerEvent {
+  id             String    @id @default(cuid())
+  type           String
+  source         String
+  status         String    @default("received")
+  payloadJson    String
+  orderId        String?
+  messageId      String?
+  taskId         String?
+  task           AgentTask? @relation(fields: [taskId], references: [id])
+  routerDecision String?
+  createdAt      DateTime  @default(now())
+}
+
+model AgentExecution {
+  id              String   @id @default(cuid())
+  taskId          String
+  task            AgentTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  agentName       String
+  modelProvider   String
+  modelName       String
+  inputSummary    String?
+  outputSummary   String?
+  status          String   @default("running")
+  errorMessage    String?
+  promptTokens    Int?
+  completionTokens Int?
+  totalTokens     Int?
+  estimatedCostUsd Float?
+  durationMs      Int?
+  createdAt       DateTime @default(now())
+  completedAt     DateTime?
+  steps           AgentStep[]
+  approvals       HumanApproval[]
+}
+
+model AgentStep {
+  id            String   @id @default(cuid())
+  executionId   String
+  execution     AgentExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  stepIndex     Int
+  stepType      String
+  title         String
+  detail        String?
+  toolName      String?
+  toolInputJson String?
+  toolResultJson String?
+  status        String   @default("completed")
+  createdAt     DateTime @default(now())
+}
+
+model HumanApproval {
+  id              String   @id @default(cuid())
+  taskId          String
+  task            AgentTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  executionId     String?
+  execution       AgentExecution? @relation(fields: [executionId], references: [id])
+  proposedAction  String
+  reason          String
+  evidenceJson    String?
+  status          String   @default("pending")
+  reviewerComment String?
+  reviewedBy      String?
+  idempotencyKey  String   @unique
+  createdAt       DateTime @default(now())
+  reviewedAt      DateTime?
+}
+
+model SimulatedEmail {
+  id          String   @id @default(cuid())
+  taskId      String?
+  task        AgentTask? @relation(fields: [taskId], references: [id])
+  orderId     String?
+  toEmail     String
+  subject     String
+  body        String
+  status      String   @default("simulated_sent")
+  provider    String   @default("simulated")
+  createdAt   DateTime @default(now())
+}
+
+model AgentSettings {
+  id                        String   @id @default("default")
+  agentEnabled              Boolean  @default(true)
+  provider                  String   @default("openai")
+  modelName                 String   @default("gpt-5-mini")
+  maxIterations             Int      @default(12)
+  executionTimeoutMs        Int      @default(120000)
+  requireApprovalForRestricted Boolean @default(true)
+  minEvidenceConfidence     String   @default("medium")
+  maxBudgetUsd              Float?   @default(1.0)
+  updatedAt                 DateTime @updatedAt
+}
+
+model EvaluationCase {
+  id               String   @id @default(cuid())
+  code             String   @unique
+  title            String
+  description      String
+  orderNumber      String?
+  prompt           String
+  expectedBehavior String
+  category         String
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  results          EvaluationResult[]
+}
+
+model EvaluationRun {
+  id          String   @id @default(cuid())
+  status      String   @default("running")
+  totalTests  Int      @default(0)
+  passed      Int      @default(0)
+  failed      Int      @default(0)
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  results     EvaluationResult[]
+}
+
+model EvaluationResult {
+  id               String   @id @default(cuid())
+  runId            String
+  run              EvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  caseId           String
+  evaluationCase   EvaluationCase @relation(fields: [caseId], references: [id])
+  passed           Boolean
+  actualBehavior   String
+  expectedBehavior String
+  notes            String?
+  taskId           String?
+  createdAt        DateTime @default(now())
+}
